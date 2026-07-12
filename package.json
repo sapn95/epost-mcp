@@ -1,0 +1,22 @@
+{
+  "name": "epost-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Swiss ePost digital letterbox (app.epost.ch) — list and download scanned letters via browser automation",
+  "type": "module",
+  "bin": { "epost-mcp": "index.js" },
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.61.0"
+  },
+  "license": "MIT",
+  "author": "sapn95",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sapn95/epost-mcp.git"
+  }
+}
