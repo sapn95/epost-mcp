@@ -287,7 +287,7 @@ const TOOLS = [
   { name: 'epost_move_to_folder', description: 'EXPERIMENTAL: move a document (by index or title substring) into a target folder in Storage. Verify the result in the ePost UI.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
 ];
 
-const server = new Server({ name: 'epost-mcp', version: '0.3.0' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'epost-mcp', version: '0.3.1' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
@@ -302,13 +302,34 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_login') {
       const p = await getPage(true);
-      await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await p.bringToFront().catch(() => {});
-      await p.waitForURL(u => String(u).includes('DigitalLetterboxOverview') || String(u).includes('app.epost.ch') && !String(u).includes('oauth_login'), { timeout: 480000 }).catch(() => {});
-      // Give the dashboard a moment, then confirm and cache.
-      const status = await ensureLetterbox(p);
+      // Wait (up to 8 min) until the user has ACTUALLY authenticated. Success is
+      // signalled by a real authenticated surface — the letterbox itself or the
+      // dashboard's "Digital Letterbox" entry — NOT merely being on app.epost.ch
+      // (the pre-redirect and login pages also live under that host, which made
+      // the old waitForURL predicate resolve instantly without waiting).
+      // We only OBSERVE here (no re-navigation), so a half-entered SwissID form
+      // is never disrupted; and we require two consecutive positive polls so a
+      // brief app-shell flash before a redirect to login can't false-positive.
+      const deadline = Date.now() + 480000;
+      let authed = false, hits = 0;
+      while (Date.now() < deadline) {
+        let ok = false;
+        if (!(await isLoginPage(p).catch(() => false))) {
+          const u = p.url();
+          ok = u.includes('DigitalLetterboxOverview')
+            || !!(await p.locator('div.letter-wrapper').count().catch(() => 0))
+            || !!(await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0));
+        }
+        hits = ok ? hits + 1 : 0;
+        if (hits >= 2) { authed = true; break; }
+        await p.waitForTimeout(2500);
+      }
+      // Now that we're authenticated it's safe to navigate into the letterbox.
+      const status = authed ? await ensureLetterbox(p) : 'login_required';
       await saveState();
-      return text({ status, message: status === 'ok' ? `Login OK — session cached to ${STATE}` : 'Login window opened but the letterbox was not reached; try again.' });
+      return text({ status, message: status === 'ok' ? `Login OK — session cached to ${STATE}` : 'Login not completed in time; run epost_login again.' });
     }
 
     const p = await getPage();
