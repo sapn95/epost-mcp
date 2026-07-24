@@ -249,10 +249,16 @@ async function createFolder(p, name) {
   if (!(await cf.count())) throw new Error('"Create a folder" button not found');
   await cf.click({ timeout: 10000 });
   await p.waitForTimeout(1500);
-  const input = p.locator('input[type="text"]:visible, input:not([type]):visible, [contenteditable="true"]:visible').first();
+  // The add-folder dialog owns its fields by id: name input ends ":folder-name",
+  // the confirm button ends ":create-btn". A generic button lookup instead hits
+  // the background "Create a folder" button behind the modal mask, so target the
+  // dialog controls directly.
+  const input = p.locator('[id$=":folder-name"]').first();
+  await input.waitFor({ state: 'visible', timeout: 8000 });
   await input.fill(name, { timeout: 8000 });
-  const confirm = p.getByRole('button', { name: /create|save|speichern|erstellen|hinzuf(ü|u)gen|add|confirm|ok|anlegen/i }).first();
-  if (await confirm.count()) await confirm.click({ timeout: 8000 });
+  await p.waitForTimeout(400);
+  const createBtn = p.locator('[id$=":create-btn"]').first();
+  if (await createBtn.count()) await createBtn.click({ timeout: 8000, force: true });
   else await p.keyboard.press('Enter');
   await p.waitForTimeout(2500);
   return { status: 'ok', created: name };
@@ -371,7 +377,7 @@ const TOOLS = [
   { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
 ];
 
-const server = new Server({ name: 'epost-mcp', version: '0.4.0' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'epost-mcp', version: '0.4.1' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
