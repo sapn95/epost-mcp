@@ -86,21 +86,32 @@ Or add it directly to `~/.claude.json`:
 | `epost_list_letters` | — | Array of `{ index, sender, title, dates, preview }` (newest first) |
 | `epost_download_letter` | `index` (number), `output_dir` (string) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |
-| `epost_list_storage` | — | `{ folders: [{ name, count }], myDocuments, url }` |
+| `epost_list_storage` | — | `{ folders: [{ name, count }], myDocuments, url }` — your **Custom** folders + the My-Documents count |
+| `epost_list_storage_documents` | `scroll_all` (bool, optional) | `{ count, documents: [{ index, date, storedIn, preview }] }` — pass `scroll_all:true` to lazy-load every card |
 | `epost_create_folder` | `name` (string) | `{ created }` |
-| `epost_move_to_folder` | `folder` (string, required); `index` (number) or `title` (substring) | `{ moved, note }` — **experimental**, see below |
+| `epost_move_to_folder` | `folder` (string, required); `index` (number) or `title` (substring) | `{ moved }` or `{ already_in_folder: true }` — files the document into the folder |
 
 ### Notes on the Storage tools
 
 The Storage area (`LetterStorage`) has auto **Companies** folders (grouped by
-sender), your **Custom** folders, and an unsorted **My Documents (N)** bucket.
-`epost_list_storage` and `epost_create_folder` read/drive the documented layout.
+sender, e.g. ePost / la Mobilière), your **Custom** folders, and the master
+**My Documents (N)** list. `epost_list_storage` returns your Custom folders and
+the My-Documents count; `epost_list_storage_documents` enumerates the individual
+documents (each only exposes a date + a `Stored in <folder>` tag once filed).
 
-`epost_move_to_folder` is **experimental**: it opens a document's `…` (three-dots)
-menu, chooses *Move*, and picks the target folder by name. The exact move dialog
-DOM can change between portal releases, so **verify the result in the ePost UI**
-after calling it. Identify the document by `index` (position in Storage) or by a
-`title` substring.
+**ePost folders are additive labels, not physical locations.** *My Documents*
+always lists every document; filing simply adds a folder membership (a document
+can belong to several folders at once). `epost_move_to_folder` reflects this: it
+opens the document's `…` menu → *Move* → ticks the target folder → confirms, and
+is **idempotent** — a no-op if the document is already in that folder, and it
+never removes an existing membership. Two consequences worth knowing:
+
+- Filing bumps a document to the top of the *Last used* order, so **re-list
+  before addressing the next document by `index`** (indices shift after a move).
+- The portal's *Move* sheet will not commit an **empty** folder set, so a
+  document that is in exactly one folder cannot be returned to "unfiled" through
+  this flow — you can only re-file it elsewhere (or delete it) in the ePost UI.
+  In other words, **filing is effectively one-way**; get the target right first.
 
 ## Environment variables
 

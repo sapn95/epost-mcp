@@ -184,7 +184,10 @@ async function goToStorage(p) {
   return 'ok';
 }
 
-// Best-effort scrape of folder tiles and the unsorted "My Documents (N)" count.
+// List the (custom) folder tiles and the unsorted "My Documents (N)" count.
+// Folder tiles render their name followed by an "N Files" badge; the branded
+// "Companies" folders (ePost / la Mobilière) show a logo instead of a text name
+// and are therefore not returned here — only the user's own move targets are.
 async function listStorage(p) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
@@ -193,23 +196,50 @@ async function listStorage(p) {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
     const seen = new Set();
     const folders = [];
-    // Folder tiles render their name and a "(count)" badge; harvest any short
-    // "Name (123)" label on the page.
     for (const el of document.querySelectorAll('*')) {
-      if (el.children.length > 3) continue;
+      if (el.children.length > 5) continue;
       const t = clean(el.innerText);
-      const m = t.match(/^(.{1,40}?)\s*\((\d+)\)$/);
-      if (m && !seen.has(t)) { seen.add(t); folders.push({ name: m[1].trim(), count: Number(m[2]) }); }
+      const m = t.match(/^(.{1,40}?)\s+(\d+)\s+Files?$/);
+      if (!m) continue;
+      const name = m[1].trim();
+      if (!name || /Files|^\d+$|\(\d+\)/.test(name)) continue; // skip mashed/branded tiles
+      const key = name + '|' + m[2];
+      if (seen.has(key)) continue;
+      seen.add(key);
+      folders.push({ name, count: Number(m[2]) });
     }
     const body = clean(document.body.innerText);
     const my = body.match(/My Documents\s*\((\d+)\)/i);
-    return {
-      url: location.href,
-      myDocuments: my ? Number(my[1]) : null,
-      folders,
-    };
+    return { url: location.href, myDocuments: my ? Number(my[1]) : null, folders };
   });
   return { status: 'ok', ...data };
+}
+
+// List the individual documents in Storage (the datascroller cards). The list
+// lazy-loads, so pass scroll_all=true to wheel-scroll until every card is in
+// the DOM. Each card only exposes "Scanned Letter" + a date (+ a "Stored in
+// <folder>" tag once filed), so that is all we can report per document.
+async function listStorageDocuments(p, { scrollAll = false } = {}) {
+  const st = await goToStorage(p);
+  if (st !== 'ok') return { status: st };
+  await p.waitForTimeout(2000);
+  const cards = p.locator('div.letter-wrapper');
+  if (scrollAll) {
+    let stable = 0;
+    for (let i = 0; i < 40 && stable < 3; i++) {
+      const before = await cards.count();
+      await p.mouse.wheel(0, 6000);
+      await p.waitForTimeout(1000);
+      stable = (await cards.count()) === before ? stable + 1 : 0;
+    }
+  }
+  const docs = await p.$$eval('div.letter-wrapper', els => els.map((el, i) => {
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+    const dates = [...el.innerText.matchAll(/\d{2}\.\d{2}\.\d{4}/g)].map(m => m[0]);
+    const stored = (el.innerText.match(/Stored in\s+([^\n]+)/) || [])[1];
+    return { index: i, date: dates[0] || null, storedIn: stored ? clean(stored) : null, preview: clean(el.innerText).slice(0, 100) };
+  }));
+  return { status: 'ok', count: docs.length, documents: docs };
 }
 
 async function createFolder(p, name) {
@@ -228,50 +258,103 @@ async function createFolder(p, name) {
   return { status: 'ok', created: name };
 }
 
-// EXPERIMENTAL: the exact move DOM could not be verified against a live session.
-// Attempts: locate the document card (by index or title substring in the
-// My-Documents list), open its "..." menu, choose Move, then pick the folder.
+// Move a Storage document into one of the user's custom folders. Flow verified
+// live against the real DOM: open the card's action menu ("..."), click the
+// (visible) "Move" item, then in the "Select a folder" bottom sheet tick the
+// target folder's checkbox and press the sheet's "Move" button.
+//
+// The document is addressed by its position (index) in the currently loaded
+// My-Documents datascroller, or by a text substring (e.g. a date "30.05.2025").
+// Pick the lowest on-screen match for both the folder option and the Move
+// button, since the bottom sheet renders below the (dimmed) folder tiles.
 async function moveToFolder(p, { index, title, folder }) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
   await p.waitForTimeout(2000);
 
-  // Resolve the target document card.
-  const cards = p.locator('.document-card, [class*="document"], .letter-wrapper, [class*="doc-card"]');
+  // Resolve the target document card (Storage documents are div.letter-wrapper).
+  const cards = p.locator('div.letter-wrapper');
   let card = null;
-  if (typeof index === 'number' && await cards.count() > index) {
+  if (typeof index === 'number') {
+    if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} loaded documents)`);
     card = cards.nth(index);
   } else if (title) {
-    const byTitle = p.locator(`text=${title}`).first();
-    if (await byTitle.count()) card = byTitle;
-  }
-  if (!card || !(await card.count())) {
-    throw new Error('document not found (pass a valid index or a title substring)');
+    card = p.locator('div.letter-wrapper', { hasText: title }).first();
+    if (!(await card.count())) throw new Error(`no document matching "${title}"`);
+  } else {
+    throw new Error('pass either index or title');
   }
   await card.scrollIntoViewIfNeeded().catch(() => {});
-  await card.hover().catch(() => {});
 
-  // Open the three-dots menu on/near the card.
-  const dots = card.locator('[aria-label*="more" i], [aria-label*="option" i], [aria-label*="menu" i], button:has-text("…"), button:has-text("...")').first();
-  const dotsGlobal = p.locator('[aria-label*="more" i], [aria-label*="option" i]').first();
-  const menuBtn = (await dots.count()) ? dots : dotsGlobal;
-  if (!(await menuBtn.count())) throw new Error('three-dots menu not found on the document card');
+  // Open this card's action menu ("...").
+  const menuBtn = card.locator('.letter-action-menu').first();
+  if (!(await menuBtn.count())) throw new Error('action menu ("...") not found on the document');
   await menuBtn.click({ timeout: 8000 });
-  await p.waitForTimeout(1200);
+  await p.waitForTimeout(1000);
 
-  const moveItem = p.getByText(/^\s*(move|verschieben)/i).first();
-  if (!(await moveItem.count())) throw new Error('"Move" entry not found in the document menu');
-  await moveItem.click({ timeout: 8000 });
+  // Click the visible "Move" item (there is one hidden tooltip menu per card).
+  if (!(await clickVisibleByText(p, 'Move'))) throw new Error('"Move" menu item did not become visible');
+  await p.waitForTimeout(1800);
+
+  // "Select a folder" bottom sheet. Each folder option is a `.brand-container`
+  // holding the name and a PrimeFaces checkbox. The checkbox sits low in a
+  // horizontal strip where a real Playwright click can be swallowed, so select
+  // it by dispatching a click in-page on the VISIBLE container's checkbox.
+  await p.locator('[id*="storage-folder-selection"]').filter({ hasText: 'Select a folder' }).first()
+    .waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
+  // ePost folder membership is a multi-select of checkboxes (a document can live
+  // in several folders), so "adding to a folder" means TICKING its box. Toggling
+  // is dangerous for bulk filing — ticking an already-member folder would REMOVE
+  // it — so this is idempotent: only tick when not already a member, and no-op
+  // (close the sheet unchanged) when the document is already filed there.
+  const picked = await p.evaluate((folderName) => {
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+    const bc = [...document.querySelectorAll('.brand-container')].find(c => clean(c.innerText) === folderName && c.offsetParent !== null);
+    if (!bc) return { ok: false };
+    const box = bc.querySelector('.ui-chkbox-box');
+    const already = box ? box.classList.contains('ui-state-active') : false;
+    const tgt = box || bc.querySelector('.folder-wrapper') || bc;
+    tgt.scrollIntoView({ block: 'center', inline: 'center' });
+    if (!already) tgt.click();
+    return { ok: true, already };
+  }, folder);
+  if (!picked.ok) throw new Error(`folder "${folder}" not offered in the move sheet`);
+  await p.waitForTimeout(600);
+
+  if (picked.already) {
+    const cancel = p.locator('[id$=":cancel"]').first();
+    if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
+    return { status: 'ok', folder, already_in_folder: true };
+  }
+
+  // Confirm with the sheet's Move button (own id ":moveBtn"; aria-disabled can
+  // lag behind the real state once a folder is ticked, so force the click).
+  const confirmBtn = p.locator('[id$=":moveBtn"]').first();
+  if (!(await confirmBtn.count())) throw new Error('move confirm button (:moveBtn) not found');
+  await confirmBtn.click({ timeout: 8000, force: true });
   await p.waitForTimeout(1500);
 
-  const folderChoice = p.getByText(folder, { exact: false }).first();
-  if (!(await folderChoice.count())) throw new Error(`target folder "${folder}" not found in the move dialog`);
-  await folderChoice.click({ timeout: 8000 });
-  await p.waitForTimeout(1000);
-  const confirm = p.getByRole('button', { name: /move|verschieben|save|speichern|confirm|ok/i }).first();
-  if (await confirm.count()) await confirm.click({ timeout: 8000 }).catch(() => {});
+  // Some moves raise a confirmation popup — accept it best-effort if present.
+  const popup = p.locator('[id*="folderMovingConfirmationPopup"]');
+  if (await popup.count()) {
+    for (const label of ['Yes', 'Move', 'Confirm', 'OK']) {
+      const b = popup.getByText(label, { exact: true }).first();
+      if ((await b.count()) && await b.isVisible().catch(() => false)) { await b.click({ timeout: 5000 }).catch(() => {}); break; }
+    }
+  }
   await p.waitForTimeout(2500);
-  return { status: 'ok', moved: { index, title, folder }, note: 'experimental — verify in the ePost UI' };
+  return { status: 'ok', moved: { index, title, folder } };
+}
+
+// Click the first VISIBLE element whose exact text is `t`.
+async function clickVisibleByText(p, t) {
+  const loc = p.getByText(t, { exact: true });
+  const n = await loc.count();
+  for (let i = 0; i < n; i++) {
+    const el = loc.nth(i);
+    if (await el.isVisible().catch(() => false)) { await el.click({ timeout: 6000 }); return true; }
+  }
+  return false;
 }
 
 // --- MCP wiring -------------------------------------------------------------
@@ -282,12 +365,13 @@ const TOOLS = [
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
-  { name: 'epost_list_storage', description: 'List the folders (with document counts) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_create_folder', description: 'Create a new folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
-  { name: 'epost_move_to_folder', description: 'EXPERIMENTAL: move a document (by index or title substring) into a target folder in Storage. Verify the result in the ePost UI.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
+  { name: 'epost_list_storage', description: 'List the user\'s custom folders (name + document count) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_list_storage_documents', description: 'List the individual documents in Storage (index, date, and "Stored in <folder>" tag if filed). Pass scroll_all=true to lazy-load every card before listing.', inputSchema: { type: 'object', properties: { scroll_all: { type: 'boolean', description: 'wheel-scroll until all cards are loaded (default false)' } } } },
+  { name: 'epost_create_folder', description: 'Create a new custom folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
+  { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
 ];
 
-const server = new Server({ name: 'epost-mcp', version: '0.3.1' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'epost-mcp', version: '0.4.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
@@ -360,6 +444,12 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_list_storage') {
       const out = await listStorage(p);
+      await saveState();
+      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      return text(out);
+    }
+    if (name === 'epost_list_storage_documents') {
+      const out = await listStorageDocuments(p, { scrollAll: args.scroll_all === true });
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
