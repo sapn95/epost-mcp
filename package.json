@@ -1,6 +1,6 @@
 {
   "name": "epost-mcp",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "MCP server for the Swiss ePost digital letterbox (app.epost.ch) — list/download scanned letters and organise Storage (list folders & documents, create folders, move documents) via Playwright, with a cached SwissID session that survives restarts",
   "type": "module",
   "bin": { "epost-mcp": "index.js" },
