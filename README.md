@@ -54,6 +54,43 @@ First-time / after-expiry flow:
 > this repo and must **never** be committed, shared, or synced to a cloud folder.
 > Delete it to force a fresh login. Override its location with `EPOST_STATE`.
 
+## Optional: passkey for hands-free re-login
+
+A cached session only lasts as long as SwissID keeps it alive — after that you
+are back to logging in by hand. To remove that step entirely, the server can
+enrol a **software passkey** using Chrome's WebAuthn *virtual authenticator*
+(CDP). The private key is ours, so an expired session is re-authenticated
+automatically: no Touch ID, no SMS code.
+
+> ⚠️ **Read this before enrolling.** A Touch-ID passkey is bound to the Secure
+> Enclave and *cannot* be exported. This one is a **software key stored in your
+> macOS login keychain** (service `epost-mcp-passkey`). Anyone who can read that
+> keychain entry can log in to **SwissID as you** — and SwissID is the identity
+> for many Swiss government services, not just ePost. You are deliberately
+> trading phishing-resistance for automation. Only do this on a machine with
+> FileVault on and a locked keychain, and only if you accept that trade.
+>
+> Note also that an automated browser can **never** use a real Touch-ID passkey:
+> platform authenticators require genuine user presence. That is why this is a
+> *virtual* authenticator, and why "just add a passkey on each device" does not
+> by itself solve the automation problem.
+
+Enrolment is a one-time, semi-interactive step:
+
+1. Call `epost_passkey_register`. A visible window opens with the virtual
+   authenticator already attached.
+2. Log in normally, go to your **SwissID security settings** and add a passkey.
+   Chrome routes the request to the virtual authenticator, so it is created
+   without any biometric prompt.
+3. The server exports the resulting credential to the keychain and confirms.
+
+From then on, `epost_status` and the letter/storage tools **heal an expired
+session by themselves** (`ensureSession` → `passkeyLogin`), and the stored
+signature counter is kept in sync so the relying party's replay check still
+passes. `epost_passkey_status` shows whether one is enrolled;
+`epost_passkey_forget` deletes the local copy — **also delete the passkey in
+your SwissID account settings** to revoke it fully.
+
 ## Register in Claude Code
 
 Use an **absolute** path to `index.js`:
@@ -83,6 +120,9 @@ Or add it directly to `~/.claude.json`:
 | --- | --- | --- |
 | `epost_status` | — | `{ status: "ok" \| "login_required" }` |
 | `epost_login` | — | Opens a visible window for the SwissID login (waits up to 8 min), then caches the session. `{ status, message }` |
+| `epost_passkey_status` | — | `{ passkey: "enrolled" \| "none", rpId, signCount }` |
+| `epost_passkey_register` | — | **One-time.** Opens a visible window with a virtual FIDO2 authenticator; add a passkey in the SwissID settings and it is exported to the keychain. See the security warning above. |
+| `epost_passkey_forget` | — | Deletes the locally stored passkey. `{ removed }` |
 | `epost_list_letters` | — | Array of `{ index, sender, title, dates, preview }` (newest first) |
 | `epost_download_letter` | `index` (number), `output_dir` (string) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |

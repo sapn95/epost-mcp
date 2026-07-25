@@ -17,6 +17,7 @@ import { chromium } from 'playwright';
 import { existsSync, readdirSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const STATE = process.env.EPOST_STATE || join(homedir(), '.epost-mcp', 'state.json');
 const APP_URL = 'https://app.epost.ch';
@@ -77,6 +78,147 @@ async function saveState() {
     mkdirSync(dirname(STATE), { recursive: true });
     await ctx.storageState({ path: STATE });
   } catch { /* best effort */ }
+}
+
+// --- passkey (WebAuthn virtual authenticator) -------------------------------
+//
+// A cached storageState only lasts as long as SwissID's session. To re-login
+// WITHOUT a human, we use Chrome's WebAuthn *virtual authenticator* (CDP):
+// a software FIDO2 authenticator whose private key we control. You register it
+// once with SwissID (in a real, headed session), we export the resulting
+// credential and keep it in the macOS keychain; from then on every login is
+// signed automatically — no Touch ID, no SMS code.
+//
+// SECURITY: a Touch-ID passkey is hardware-bound and cannot be exported. This
+// one is a software key held in the login keychain, so anyone who can read that
+// keychain entry can log into SwissID as you. It is a deliberate trade of
+// phishing-resistance for automation. Use `epost_passkey_forget` to revoke
+// locally, and remove the passkey in the SwissID account settings too.
+
+const KC_SERVICE = 'epost-mcp-passkey';
+
+function keychainRead(service, account = 'epost') {
+  try {
+    return execFileSync('security', ['find-generic-password', '-a', account, '-s', service, '-w'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch { return ''; }
+}
+function keychainWrite(service, value, account = 'epost') {
+  execFileSync('security', ['add-generic-password', '-a', account, '-s', service, '-w', value, '-U'],
+    { stdio: ['ignore', 'ignore', 'ignore'] });
+}
+function keychainDelete(service, account = 'epost') {
+  try {
+    execFileSync('security', ['delete-generic-password', '-a', account, '-s', service],
+      { stdio: ['ignore', 'ignore', 'ignore'] });
+    return true;
+  } catch { return false; }
+}
+
+function loadPasskey() {
+  const raw = keychainRead(KC_SERVICE);
+  if (!raw) return null;
+  try {
+    const c = JSON.parse(raw);
+    return c?.credentialId && c?.privateKey && c?.rpId ? c : null;
+  } catch { return null; }
+}
+
+// Attach a virtual authenticator to `p`'s target. `automaticPresenceSimulation`
+// makes it approve user-presence/verification prompts by itself.
+async function attachAuthenticator(p) {
+  const cdp = await ctx.newCDPSession(p);
+  await cdp.send('WebAuthn.enable', { enableUI: false });
+  const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
+    options: {
+      protocol: 'ctap2',
+      ctap2Version: 'ctap2_1',
+      transport: 'internal',       // pose as a platform authenticator (Touch ID-like)
+      hasResidentKey: true,        // discoverable credential → usernameless login
+      hasUserVerification: true,
+      isUserVerified: true,
+      automaticPresenceSimulation: true,
+      defaultBackupEligibility: true,
+      defaultBackupState: true,
+    },
+  });
+  return { cdp, authenticatorId };
+}
+
+// Load the stored credential into a fresh virtual authenticator so the next
+// WebAuthn assertion on the login page can be signed without a human.
+async function armPasskey(p) {
+  const cred = loadPasskey();
+  if (!cred) return null;
+  const { cdp, authenticatorId } = await attachAuthenticator(p);
+  await cdp.send('WebAuthn.addCredential', {
+    authenticatorId,
+    credential: {
+      credentialId: cred.credentialId,
+      isResidentCredential: true,
+      rpId: cred.rpId,
+      privateKey: cred.privateKey,
+      userHandle: cred.userHandle || undefined,
+      signCount: cred.signCount || 0,
+    },
+  });
+  return { cdp, authenticatorId, cred };
+}
+
+// Click whatever offers a passkey login on the current SwissID screen.
+async function clickPasskeyAffordance(p) {
+  const patterns = [/passkey/i, /pass-key/i, /sicherheitsschl(ü|u)ssel/i, /security key/i, /biometri/i, /fido/i];
+  for (const re of patterns) {
+    for (const loc of [p.getByRole('button', { name: re }), p.getByRole('link', { name: re }), p.getByText(re)]) {
+      const n = await loc.count().catch(() => 0);
+      for (let i = 0; i < n; i++) {
+        const el = loc.nth(i);
+        if (await el.isVisible().catch(() => false)) {
+          await el.click({ timeout: 6000 }).catch(() => {});
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Full non-interactive re-login. Returns 'ok' | 'login_required' | 'no_passkey'.
+async function passkeyLogin(p) {
+  const armed = await armPasskey(p);
+  if (!armed) return 'no_passkey';
+  try {
+    await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    for (let i = 0; i < 24; i++) {
+      await p.waitForTimeout(2000);
+      if (!(await isLoginPage(p).catch(() => false))) {
+        const u = p.url();
+        if (u.includes('DigitalLetterboxOverview')
+          || await p.locator('div.letter-wrapper').count().catch(() => 0)
+          || await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0)) {
+          // Persist the bumped signature counter so the RP's replay check passes.
+          await syncSignCount(armed).catch(() => {});
+          return await ensureLetterbox(p);
+        }
+        continue;
+      }
+      // On the login screen: surface the passkey option (conditional UI often
+      // fires on its own; clicking is the fallback for an explicit button).
+      await clickPasskeyAffordance(p);
+    }
+    return 'login_required';
+  } finally {
+    await armed.cdp.detach().catch(() => {});
+  }
+}
+
+// Keep the stored signCount in step with the authenticator's, so the relying
+// party does not reject the next assertion as a clone/replay.
+async function syncSignCount(armed) {
+  const { credentials } = await armed.cdp.send('WebAuthn.getCredentials', { authenticatorId: armed.authenticatorId });
+  const live = (credentials || []).find(c => c.credentialId === armed.cred.credentialId);
+  if (!live) return;
+  keychainWrite(KC_SERVICE, JSON.stringify({ ...armed.cred, signCount: live.signCount || 0 }));
 }
 
 // --- navigation helpers -----------------------------------------------------
@@ -171,7 +313,7 @@ async function downloadLetter(p, index, outputDir, meta) {
 
 // Navigate from the letterbox into the Storage view (URL contains LetterStorage).
 async function goToStorage(p) {
-  const st = await ensureLetterbox(p);
+  const st = await ensureSession(p);
   if (st !== 'ok') return st;
   if (!p.url().includes('LetterStorage')) {
     const gs = p.getByText('Go to Storage', { exact: false }).first();
@@ -352,6 +494,46 @@ async function moveToFolder(p, { index, title, folder }) {
   return { status: 'ok', moved: { index, title, folder } };
 }
 
+// One-time interactive enrolment: opens a headed window with a virtual
+// authenticator already attached, waits while YOU add a passkey in the SwissID
+// security settings, then exports the created credential to the keychain.
+async function passkeyRegister(p, waitMs = 480000) {
+  const { cdp, authenticatorId } = await attachAuthenticator(p);
+  try {
+    await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await p.bringToFront().catch(() => {});
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      const { credentials } = await cdp.send('WebAuthn.getCredentials', { authenticatorId });
+      const c = (credentials || [])[0];
+      if (c?.credentialId && c?.privateKey) {
+        keychainWrite(KC_SERVICE, JSON.stringify({
+          credentialId: c.credentialId,
+          rpId: c.rpId,
+          privateKey: c.privateKey,
+          userHandle: c.userHandle || '',
+          signCount: c.signCount || 0,
+        }));
+        await saveState();
+        return { status: 'ok', rpId: c.rpId, stored_in: `macOS keychain (${KC_SERVICE})` };
+      }
+      await p.waitForTimeout(2500);
+    }
+    return { status: 'timeout', message: 'No passkey was created in the open window.' };
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+// Letterbox access that heals an expired session by itself when a passkey is
+// enrolled: try normally, and on login_required re-authenticate and retry once.
+async function ensureSession(p) {
+  let st = await ensureLetterbox(p);
+  if (st === 'ok' || !loadPasskey()) return st;
+  st = await passkeyLogin(p);
+  return st === 'no_passkey' ? 'login_required' : st;
+}
+
 // Click the first VISIBLE element whose exact text is `t`.
 async function clickVisibleByText(p, t) {
   const loc = p.getByText(t, { exact: true });
@@ -368,6 +550,9 @@ async function clickVisibleByText(p, t) {
 const TOOLS = [
   { name: 'epost_status', description: 'Check whether the ePost session is alive (ok) or an interactive SwissID login is needed (login_required).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_login', description: 'Open a VISIBLE browser window on app.epost.ch so you can complete the SwissID login (incl. 2FA). Waits up to 8 minutes, then caches the session to disk.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_passkey_status', description: 'Report whether a software passkey is enrolled for hands-free SwissID re-login.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_passkey_register', description: 'ONE-TIME: open a visible window with a virtual FIDO2 authenticator attached; add a passkey in your SwissID security settings and the credential is exported to the macOS keychain. Afterwards expired sessions re-login automatically, with no Touch ID or SMS code. SECURITY: this key is software-held and exportable — it trades phishing-resistance for automation.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_passkey_forget', description: 'Delete the locally stored passkey from the macOS keychain (also remove it in the SwissID account settings to fully revoke).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
@@ -377,7 +562,7 @@ const TOOLS = [
   { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
 ];
 
-const server = new Server({ name: 'epost-mcp', version: '0.4.1' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'epost-mcp', version: '0.5.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
@@ -386,9 +571,24 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     if (name === 'epost_status') {
       const p = await getPage();
-      const status = await ensureLetterbox(p);
+      const status = await ensureSession(p);
       await saveState();
-      return text({ status });
+      return text({ status, passkey: loadPasskey() ? 'enrolled' : 'none' });
+    }
+    if (name === 'epost_passkey_status') {
+      const c = loadPasskey();
+      return text(c
+        ? { passkey: 'enrolled', rpId: c.rpId, signCount: c.signCount, stored_in: `macOS keychain (${KC_SERVICE})` }
+        : { passkey: 'none', hint: 'Run epost_passkey_register once to enable hands-free re-login.' });
+    }
+    if (name === 'epost_passkey_register') {
+      const p = await getPage(true);
+      const out = await passkeyRegister(p);
+      return text(out);
+    }
+    if (name === 'epost_passkey_forget') {
+      const removed = keychainDelete(KC_SERVICE);
+      return text({ removed, note: 'Also delete the passkey in your SwissID account settings to fully revoke it.' });
     }
     if (name === 'epost_login') {
       const p = await getPage(true);
@@ -425,14 +625,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     const p = await getPage();
 
     if (name === 'epost_list_letters') {
-      const st = await ensureLetterbox(p);
+      const st = await ensureSession(p);
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const out = await listLetters(p);
       await saveState();
       return text(out);
     }
     if (name === 'epost_download_letter') {
-      const st = await ensureLetterbox(p);
+      const st = await ensureSession(p);
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const letters = await listLetters(p);
       const saved = await downloadLetter(p, args.index, args.output_dir, letters[args.index]);
@@ -440,7 +640,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       return text({ saved });
     }
     if (name === 'epost_download_all') {
-      const st = await ensureLetterbox(p);
+      const st = await ensureSession(p);
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const letters = await listLetters(p);
       const saved = [];
