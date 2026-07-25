@@ -124,25 +124,48 @@ function loadPasskey() {
   } catch { return null; }
 }
 
-// Attach a virtual authenticator to `p`'s target. `automaticPresenceSimulation`
-// makes it approve user-presence/verification prompts by itself.
+// Attach virtual authenticators to `p`'s target. `automaticPresenceSimulation`
+// makes them approve user-presence/verification prompts by themselves.
+//
+// We register BOTH transports on purpose. A relying party may ask for a
+// platform authenticator (authenticatorAttachment "platform" → Touch ID-like)
+// or for a roaming security key ("cross-platform" → USB). An authenticator
+// whose transport does not match the request is simply not eligible, and Chrome
+// then sits on its "Insert your security key and touch it" dialog forever —
+// which is exactly what SwissID's register-passkey page triggers. Offering an
+// `internal` and a `usb` authenticator satisfies either path.
+const AUTH_BASE = {
+  protocol: 'ctap2',
+  ctap2Version: 'ctap2_1',
+  hasResidentKey: true,          // discoverable credential → usernameless login
+  hasUserVerification: true,
+  isUserVerified: true,
+  automaticPresenceSimulation: true,
+  defaultBackupEligibility: true,
+  defaultBackupState: true,
+};
+
 async function attachAuthenticator(p) {
   const cdp = await ctx.newCDPSession(p);
   await cdp.send('WebAuthn.enable', { enableUI: false });
-  const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
-    options: {
-      protocol: 'ctap2',
-      ctap2Version: 'ctap2_1',
-      transport: 'internal',       // pose as a platform authenticator (Touch ID-like)
-      hasResidentKey: true,        // discoverable credential → usernameless login
-      hasUserVerification: true,
-      isUserVerified: true,
-      automaticPresenceSimulation: true,
-      defaultBackupEligibility: true,
-      defaultBackupState: true,
-    },
-  });
-  return { cdp, authenticatorId };
+  const ids = [];
+  for (const transport of ['internal', 'usb']) {
+    const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
+      options: { ...AUTH_BASE, transport },
+    });
+    ids.push({ authenticatorId, transport });
+  }
+  return { cdp, ids, authenticatorId: ids[0].authenticatorId };
+}
+
+// First credential found across every attached authenticator.
+async function findCredential(cdp, ids) {
+  for (const { authenticatorId, transport } of ids) {
+    const { credentials } = await cdp.send('WebAuthn.getCredentials', { authenticatorId }).catch(() => ({ credentials: [] }));
+    const c = (credentials || []).find(x => x.privateKey);
+    if (c) return { ...c, transport, authenticatorId };
+  }
+  return null;
 }
 
 // Load the stored credential into a fresh virtual authenticator so the next
@@ -150,19 +173,23 @@ async function attachAuthenticator(p) {
 async function armPasskey(p) {
   const cred = loadPasskey();
   if (!cred) return null;
-  const { cdp, authenticatorId } = await attachAuthenticator(p);
-  await cdp.send('WebAuthn.addCredential', {
-    authenticatorId,
-    credential: {
-      credentialId: cred.credentialId,
-      isResidentCredential: true,
-      rpId: cred.rpId,
-      privateKey: cred.privateKey,
-      userHandle: cred.userHandle || undefined,
-      signCount: cred.signCount || 0,
-    },
-  });
-  return { cdp, authenticatorId, cred };
+  const { cdp, ids } = await attachAuthenticator(p);
+  // Load the key into every attached authenticator, so the assertion succeeds
+  // whichever attachment the login page asks for.
+  for (const { authenticatorId } of ids) {
+    await cdp.send('WebAuthn.addCredential', {
+      authenticatorId,
+      credential: {
+        credentialId: cred.credentialId,
+        isResidentCredential: true,
+        rpId: cred.rpId,
+        privateKey: cred.privateKey,
+        userHandle: cred.userHandle || undefined,
+        signCount: cred.signCount || 0,
+      },
+    }).catch(() => {});
+  }
+  return { cdp, ids, cred };
 }
 
 // Click whatever offers a passkey login on the current SwissID screen.
@@ -215,10 +242,13 @@ async function passkeyLogin(p) {
 // Keep the stored signCount in step with the authenticator's, so the relying
 // party does not reject the next assertion as a clone/replay.
 async function syncSignCount(armed) {
-  const { credentials } = await armed.cdp.send('WebAuthn.getCredentials', { authenticatorId: armed.authenticatorId });
-  const live = (credentials || []).find(c => c.credentialId === armed.cred.credentialId);
-  if (!live) return;
-  keychainWrite(KC_SERVICE, JSON.stringify({ ...armed.cred, signCount: live.signCount || 0 }));
+  let best = armed.cred.signCount || 0;
+  for (const { authenticatorId } of armed.ids) {
+    const { credentials } = await armed.cdp.send('WebAuthn.getCredentials', { authenticatorId }).catch(() => ({ credentials: [] }));
+    const live = (credentials || []).find(c => c.credentialId === armed.cred.credentialId);
+    if (live && (live.signCount || 0) > best) best = live.signCount;
+  }
+  keychainWrite(KC_SERVICE, JSON.stringify({ ...armed.cred, signCount: best }));
 }
 
 // --- navigation helpers -----------------------------------------------------
@@ -498,14 +528,13 @@ async function moveToFolder(p, { index, title, folder }) {
 // authenticator already attached, waits while YOU add a passkey in the SwissID
 // security settings, then exports the created credential to the keychain.
 async function passkeyRegister(p, waitMs = 480000) {
-  const { cdp, authenticatorId } = await attachAuthenticator(p);
+  const { cdp, ids } = await attachAuthenticator(p);
   try {
     await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await p.bringToFront().catch(() => {});
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
-      const { credentials } = await cdp.send('WebAuthn.getCredentials', { authenticatorId });
-      const c = (credentials || [])[0];
+      const c = await findCredential(cdp, ids);
       if (c?.credentialId && c?.privateKey) {
         keychainWrite(KC_SERVICE, JSON.stringify({
           credentialId: c.credentialId,
@@ -515,11 +544,14 @@ async function passkeyRegister(p, waitMs = 480000) {
           signCount: c.signCount || 0,
         }));
         await saveState();
-        return { status: 'ok', rpId: c.rpId, stored_in: `macOS keychain (${KC_SERVICE})` };
+        return { status: 'ok', rpId: c.rpId, transport: c.transport, stored_in: `macOS keychain (${KC_SERVICE})` };
       }
       await p.waitForTimeout(2500);
     }
-    return { status: 'timeout', message: 'No passkey was created in the open window.' };
+    // No passkey appeared, but the window may still have been used to log in —
+    // keep that session rather than throwing the manual login away.
+    await saveState();
+    return { status: 'timeout', message: 'No passkey was created in the open window; any session established there was cached.' };
   } finally {
     await cdp.detach().catch(() => {});
   }
@@ -551,7 +583,7 @@ const TOOLS = [
   { name: 'epost_status', description: 'Check whether the ePost session is alive (ok) or an interactive SwissID login is needed (login_required).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_login', description: 'Open a VISIBLE browser window on app.epost.ch so you can complete the SwissID login (incl. 2FA). Waits up to 8 minutes, then caches the session to disk.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_passkey_status', description: 'Report whether a software passkey is enrolled for hands-free SwissID re-login.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_passkey_register', description: 'ONE-TIME: open a visible window with a virtual FIDO2 authenticator attached; add a passkey in your SwissID security settings and the credential is exported to the macOS keychain. Afterwards expired sessions re-login automatically, with no Touch ID or SMS code. SECURITY: this key is software-held and exportable — it trades phishing-resistance for automation.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_passkey_register', description: 'ONE-TIME: open a visible window with a virtual FIDO2 authenticator attached; add a passkey in your SwissID security settings and the credential is exported to the macOS keychain. Afterwards expired sessions re-login automatically, with no Touch ID or SMS code. SECURITY: this key is software-held and exportable — it trades phishing-resistance for automation.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 480)' } } } },
   { name: 'epost_passkey_forget', description: 'Delete the locally stored passkey from the macOS keychain (also remove it in the SwissID account settings to fully revoke).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
@@ -583,7 +615,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_passkey_register') {
       const p = await getPage(true);
-      const out = await passkeyRegister(p);
+      const out = await passkeyRegister(p, Math.max(30, Number(args.wait_seconds) || 480) * 1000);
       return text(out);
     }
     if (name === 'epost_passkey_forget') {
