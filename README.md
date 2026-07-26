@@ -163,6 +163,7 @@ Or add it directly to `~/.claude.json`:
 | `epost_store_letter` | `folder` (required); `index` or `title` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` |
 | `epost_list_storage` | — | `{ folders: [{ name, count }], myDocuments, url }` — your **Custom** folders + the My-Documents count |
 | `epost_list_storage_documents` | `scroll_all` (bool, optional) | `{ count, documents: [{ index, date, storedIn, preview }] }` — pass `scroll_all:true` to lazy-load every card |
+| `epost_read_storage_document` | `index` or `title`; `output_dir` (optional) | Opens one Storage document: real sender/subject, document type, date, amount, folder — and saves the PDF when `output_dir` is given. The only way to classify an archived document, since the card list only ever says "Gescannter Brief". |
 | `epost_create_folder` | `name` (string) | `{ created }` |
 | `epost_move_to_folder` | `folder` (required); `index` or `title`; `remove_from` (optional) | Files a Storage document into a folder. `remove_from` unticks the old folder in the same sheet — the only way to empty one. |
 | `epost_unfile_from_folder` | `folder` (required); `index` or `title` | Removes a folder membership. Only works while the document is in more than one folder (see below). |

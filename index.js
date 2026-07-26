@@ -918,6 +918,73 @@ async function storeLetter(p, { index, title, folder }) {
   return { status: 'ok', stored: label, folder };
 }
 
+
+// Open a Storage document and read what the portal knows about it — optionally
+// saving the PDF. This is the piece that makes sorting the archive possible: the
+// card list only ever says "Gescannter Brief", while the detail panel names the
+// actual sender, the document type and the amount.
+//
+// Storage documents ARE downloadable, contrary to what the card's "..." menu
+// suggests: the menu only offers Copy / Move / Delete, but clicking the card
+// opens a viewer whose toolbar carries the same "Download File" button as the
+// inbox. Looking only at the menu is what made this look impossible.
+async function readStorageDocument(p, { index, title, outputDir }) {
+  const st = await goToStorage(p);
+  if (st !== 'ok') return { status: st };
+  await p.waitForTimeout(1500);
+  await loadAllCards(p);
+
+  const cards = p.locator('div.letter-wrapper');
+  let card = null;
+  if (typeof index === 'number') {
+    if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} documents)`);
+    card = cards.nth(index);
+  } else if (title) {
+    card = p.locator('div.letter-wrapper', { hasText: title }).first();
+    if (!(await card.count())) throw new Error(`no document matching "${title}"`);
+  } else throw new Error('pass either index or title');
+
+  await card.scrollIntoViewIfNeeded().catch(() => {});
+  // The click target is the card body; the outer wrapper does not carry it.
+  const body = card.locator('.letter-content').first();
+  await (await body.count() ? body : card).click({ timeout: 10000 });
+  await p.waitForTimeout(3500);
+
+  const meta = await p.evaluate(() => {
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+    const body = clean(document.body.innerText);
+    const pick = re => (re.exec(body) || [])[1]?.trim() || null;
+    return {
+      subject: pick(/Gescannter Brief\s+(Invoice from [^C]+?)(?=\s+CHF|\s+Document type)/i),
+      documentType: pick(/Document type\s+(\S+)/i),
+      documentDate: pick(/Document date\s+(\d{2}\.\d{2}\.\d{4})/i),
+      amount: pick(/CHF\s+([\d'’,.]+)/),
+      storedIn: [...body.matchAll(/Stored in\s+([^\n]{1,60}?)(?=\s+Example|\s+Tracking|$)/gi)].map(m => m[1].trim())[0] || null,
+      trackingNumber: pick(/Tracking number:\s*(\S+)/i),
+      letterId: pick(/Letter ID:\s*(\S+)/i),
+    };
+  });
+
+  let saved = null;
+  if (outputDir) {
+    mkdirSync(outputDir, { recursive: true });
+    const btn = p.getByRole('button', { name: 'Download File' }).first();
+    const target = (await btn.count()) ? btn : p.locator('a.st-harddrive-download').first();
+    if (await target.count()) {
+      const [d] = await Promise.all([
+        p.waitForEvent('download', { timeout: 25000 }),
+        target.click({ timeout: 10000 }),
+      ]);
+      const stamp = (meta.documentDate || '').split('.').reverse().join('-') || 'undated';
+      saved = join(outputDir, `${stamp}_ePostStorage_${index ?? 'x'}.pdf`);
+      await d.saveAs(saved);
+    }
+  }
+  await p.keyboard.press('Escape').catch(() => {});
+  await p.waitForTimeout(1200);
+  return { status: 'ok', index, ...meta, saved };
+}
+
 // Click the first VISIBLE element whose exact text is `t`.
 async function clickVisibleByText(p, t) {
   const loc = p.getByText(t, { exact: true });
@@ -944,6 +1011,7 @@ const TOOLS = [
   { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
   { name: 'epost_list_storage', description: 'List the user\'s custom folders (name + document count) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_storage_documents', description: 'List the individual documents in Storage (index, date, and "Stored in <folder>" tag if filed). Pass scroll_all=true to lazy-load every card before listing.', inputSchema: { type: 'object', properties: { scroll_all: { type: 'boolean', description: 'wheel-scroll until all cards are loaded (default false)' } } } },
+  { name: 'epost_read_storage_document', description: 'Open one Storage document and report what the portal knows about it: the real sender/subject line, document type, date, amount and current folder. The card list only ever shows "Gescannter Brief", so this is the only way to classify an archived document. Pass output_dir to also save the PDF.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, output_dir: { type: 'string', description: 'save the PDF here as well' } } } },
   { name: 'epost_create_folder', description: 'Create a new custom folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
   { name: 'epost_unfile_from_folder', description: 'Remove a Storage document from a folder. NOTE: the portal will not commit an empty folder set, so this only works when the document is in more than one folder; to empty a folder that holds the document\'s only membership, use epost_move_to_folder with remove_from instead.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
   { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
@@ -1063,6 +1131,12 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_list_storage_documents') {
       const out = await listStorageDocuments(p, { scrollAll: args.scroll_all === true });
+      await saveState();
+      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      return text(out);
+    }
+    if (name === 'epost_read_storage_document') {
+      const out = await readStorageDocument(p, { index: args.index, title: args.title, outputDir: args.output_dir });
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
