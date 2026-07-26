@@ -15,7 +15,8 @@
     "postinstall-hint": "npx playwright install chromium",
     "smoke": "node scripts/smoke.mjs",
     "hygiene": "node scripts/hygiene.mjs",
-    "test": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs"
+    "test": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs",
+    "prepublishOnly": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs"
   },
   "keywords": [
     "mcp",
@@ -38,5 +39,14 @@
   "homepage": "https://github.com/sapn95/epost-mcp#readme",
   "bugs": {
     "url": "https://github.com/sapn95/epost-mcp/issues"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }
