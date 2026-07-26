@@ -22,6 +22,11 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
+// Name and version come from package.json, never from a second copy here:
+// `npm version` only bumps package.json, so a hardcoded string silently
+// advertises a stale version to every client.
+const PKG = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+
 const STATE = process.env.EPOST_STATE || join(homedir(), '.epost-mcp', 'state.json');
 const PROFILE = process.env.EPOST_PROFILE || join(homedir(), '.epost-mcp', 'profile');
 const APP_URL = 'https://app.epost.ch';
@@ -944,7 +949,7 @@ const TOOLS = [
   { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
 ];
 
-const server = new Server({ name: 'epost-mcp', version: '0.7.0' }, { capabilities: { tools: {} } });
+const server = new Server({ name: PKG.name, version: PKG.version }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
