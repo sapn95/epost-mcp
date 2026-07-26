@@ -1,5 +1,8 @@
 # epost-mcp
 
+[![npm](https://img.shields.io/npm/v/epost-mcp?logo=npm)](https://www.npmjs.com/package/epost-mcp)
+[![CI](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml)
+
 > **Unofficial, and inherently fragile.** This drives a web portal with a real
 > browser because the service offers no retrieval API. Portal updates break
 > selectors without warning, and a broken selector means a failed run rather
