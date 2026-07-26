@@ -1,5 +1,12 @@
 # epost-mcp
 
+> **Unofficial, and inherently fragile.** This drives a web portal with a real
+> browser because the service offers no retrieval API. Portal updates break
+> selectors without warning, and a broken selector means a failed run rather
+> than a wrong result. It is published because it is useful, not because it is
+> guaranteed — pin a version, read the errors, and expect to update. Use it for
+> **your own** account and respect the provider's terms of service.
+
 An [MCP](https://modelcontextprotocol.io) server for the Swiss **ePost** digital
 letterbox ([app.epost.ch](https://app.epost.ch)). It lets an MCP client (Claude
 Code, Claude Desktop, …) **list and download your scanned letters** and do basic
