@@ -150,10 +150,12 @@ Or add it directly to `~/.claude.json`:
 | `epost_list_letters` | — | Array of `{ index, sender, title, dates, preview }` (newest first) |
 | `epost_download_letter` | `index` (number), `output_dir` (string) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |
+| `epost_store_letter` | `folder` (required); `index` or `title` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` |
 | `epost_list_storage` | — | `{ folders: [{ name, count }], myDocuments, url }` — your **Custom** folders + the My-Documents count |
 | `epost_list_storage_documents` | `scroll_all` (bool, optional) | `{ count, documents: [{ index, date, storedIn, preview }] }` — pass `scroll_all:true` to lazy-load every card |
 | `epost_create_folder` | `name` (string) | `{ created }` |
-| `epost_move_to_folder` | `folder` (string, required); `index` (number) or `title` (substring) | `{ moved }` or `{ already_in_folder: true }` — files the document into the folder |
+| `epost_move_to_folder` | `folder` (required); `index` or `title`; `remove_from` (optional) | Files a Storage document into a folder. `remove_from` unticks the old folder in the same sheet — the only way to empty one. |
+| `epost_unfile_from_folder` | `folder` (required); `index` or `title` | Removes a folder membership. Only works while the document is in more than one folder (see below). |
 
 ### Notes on the Storage tools
 
@@ -162,6 +164,24 @@ sender, e.g. ePost / la Mobilière), your **Custom** folders, and the master
 **My Documents (N)** list. `epost_list_storage` returns your Custom folders and
 the My-Documents count; `epost_list_storage_documents` enumerates the individual
 documents (each only exposes a date + a `Stored in <folder>` tag once filed).
+
+### Archiving a letter (`epost_store_letter`)
+
+`Store` in the card menu is a **two-step** action: it opens a *Select a folder*
+sheet carrying its own Store button, greyed out until a folder is ticked. That is
+why a folder argument is required — without one the sheet cannot commit, and
+stopping after the first click archives nothing while leaving an invisible
+overlay that swallows every later click.
+
+Three things inside that sheet make a folder that is plainly there look absent,
+all of them handled now but worth knowing if it ever regresses:
+
+- `.brand-container` also matches the letter cards *behind* the sheet, so the
+  lookup has to be scoped to the sheet element.
+- The tiles sit in a horizontally scrolling strip, so filtering on visibility
+  drops every folder off to the right.
+- Folder names must be compared **NFC-normalised**: a name with an umlaut is NFC
+  on one side and NFD on the other, and a byte-exact compare never matches.
 
 **ePost folders are additive labels, not physical locations.** *My Documents*
 always lists every document; filing simply adds a folder membership (a document
