@@ -54,43 +54,65 @@ First-time / after-expiry flow:
 > this repo and must **never** be committed, shared, or synced to a cloud folder.
 > Delete it to force a fresh login. Override its location with `EPOST_STATE`.
 
-## Passkey: does NOT work against SwissID (tested)
+## Login: one fingerprint, nothing else
 
-The idea was to remove the interactive login entirely by enrolling a **software
-passkey** through Chrome's WebAuthn *virtual authenticator* (CDP) and signing
-the login automatically. The mechanism itself works — it was verified end to end
-against a local relying party: key created, private key exported, and a brand
-new browser context signed a valid assertion with no user interaction.
+`epost_login` drives every step of the SwissID chain that does not need a human
+and stops at the only one that does — the biometric prompt:
 
-**SwissID refuses it**, and says exactly why. Its registration page asks for
-
-```json
-{ "attestation": "indirect",
-  "authenticatorSelection": { "userVerification": "required", "requireResidentKey": true } }
+```
+app.epost.ch → login.epost.ch     clicks "Login mit SwissID"
+             → login-email         fills your account e-mail, "Weiter"
+             → confirm-passkey     "Weiter"   → macOS asks for Touch ID   ← you
+             → app.epost.ch, authenticated; session cached
 ```
 
-the key is created fine every time, and then the server answers:
+Measured end to end: **19 seconds**, one fingerprint, no password and no SMS
+code. Two things have to be in place:
+
+1. **A passkey on your SwissID account**, created normally in Safari or Chrome
+   (`account.swissid.ch` → Login-Einstellungen). Apple's authenticator is
+   accepted; see the note below for why a software one is not.
+2. **A signed browser.** Playwright's bundled Chromium is an unsigned test build
+   and reports `isUserVerifyingPlatformAuthenticatorAvailable() === false`, so
+   Touch ID is never offered and SwissID falls back to password + SMS. Installed
+   Google Chrome reports `true`. The server therefore prefers a signed system
+   browser automatically — `chrome`, `chrome-canary`, `edge`, `brave`, in that
+   order — and falls back to the bundled Chromium. Override with `EPOST_BROWSER`.
+
+Tell it which account to fill in, either way:
+
+```bash
+security add-generic-password -a epost -s epost-mcp-swissid-user \
+  -w 'you@example.com' -U          # or: export EPOST_SWISSID_USER=you@example.com
+```
+
+`epost_settings` prints what was resolved — browser, passkey capability, paths,
+and whether the account e-mail is configured. Run it first if a login surprises
+you.
+
+### Why the login cannot be fully unattended
+
+The tempting idea is a *software* passkey via Chrome's WebAuthn virtual
+authenticator, so the server could sign the login itself. That mechanism works
+in general — verified end to end against a local relying party — but SwissID
+rejects it, and says so plainly:
 
 ```
 POST /api-login/authenticate/webauthn-register  ->  400
 ERROR::WebauthnVendorNotAllowed: This webauthn passkey authenticator vendor is not allowed by SwissID
 ```
 
-So SwissID validates the attestation's **AAGUID** — the authenticator's vendor
-id — against an allow-list of approved hardware makers. A virtual authenticator
-is not on that list. Getting past it would mean forging a listed vendor's
-identity, which is precisely the control being enforced; this project does not
-attempt that.
+SwissID requests attestation and checks the authenticator's **AAGUID** (its
+vendor id) against an allow-list of approved hardware makers. The credential was
+created successfully on all six attempts; the server refused every one. Getting
+past that would mean forging an approved vendor's identity, which is precisely
+the control being enforced, so this project does not attempt it.
 
-Note also that a *real* Touch ID passkey does not help either: a platform
-authenticator requires genuine user presence, which an automated browser cannot
-provide. So for ePost the answer is simply: **log in interactively once, and let
-the cached session do the rest** — which is what the session model above does.
-
-`epost_passkey_register` / `_status` / `_forget` are kept for relying parties
-that do accept software authenticators. Registration only reports success once
-the server has actually stored the credential; a local key alone is never
-treated as success (that mistake produced a convincing false positive).
+A real Touch ID passkey cannot be automated either: a platform authenticator
+requires genuine user presence, by design. Hence the split above — automate all
+of it except the fingerprint. `epost_passkey_register` / `_status` / `_forget`
+remain for relying parties that do accept software authenticators, and
+registration only reports success once the server has stored the credential.
 
 ## Register in Claude Code
 
@@ -120,7 +142,8 @@ Or add it directly to `~/.claude.json`:
 | Tool | Params | Returns |
 | --- | --- | --- |
 | `epost_status` | — | `{ status: "ok" \| "login_required" }` |
-| `epost_login` | — | Opens a visible window for the SwissID login (waits up to 8 min), then caches the session. `{ status, message }` |
+| `epost_login` | `wait_seconds` (optional, default 300) | Opens a visible window and drives the SwissID chain up to the Touch ID prompt. `{ status, browser, message }` |
+| `epost_settings` | — | Resolved browser + why, Touch ID capability, paths, whether the account e-mail is set |
 | `epost_passkey_status` | — | `{ passkey: "enrolled" \| "none", rpId, signCount }` |
 | `epost_passkey_register` | — | **One-time.** Opens a visible window with a virtual FIDO2 authenticator. Returns `rejected` against SwissID — see the passkey section. |
 | `epost_passkey_forget` | — | Deletes the locally stored passkey. `{ removed }` |
