@@ -1,6 +1,6 @@
 {
   "name": "epost-mcp",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "MCP server for the Swiss ePost digital letterbox: list and download scanned letters, manage Storage folders, with a cached session and an assisted one-fingerprint SwissID login.",
   "type": "module",
   "bin": {
