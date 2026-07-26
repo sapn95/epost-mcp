@@ -12,7 +12,10 @@
   },
   "scripts": {
     "start": "node index.js",
-    "postinstall-hint": "npx playwright install chromium"
+    "postinstall-hint": "npx playwright install chromium",
+    "smoke": "node scripts/smoke.mjs",
+    "hygiene": "node scripts/hygiene.mjs",
+    "test": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs"
   },
   "keywords": [
     "mcp",
