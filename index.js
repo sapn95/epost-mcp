@@ -96,6 +96,7 @@ async function saveState() {
 // locally, and remove the passkey in the SwissID account settings too.
 
 const KC_SERVICE = 'epost-mcp-passkey';
+const DEBUG = !!process.env.EPOST_DEBUG;   // trace the passkey login stations on stderr
 
 function keychainRead(service, account = 'epost') {
   try {
@@ -211,15 +212,31 @@ async function clickPasskeyAffordance(p) {
 }
 
 // Full non-interactive re-login. Returns 'ok' | 'login_required' | 'no_passkey'.
+//
+// The route from an expired session to the letterbox has four stations, and the
+// passkey only becomes available at the last one:
+//   app.epost.ch
+//     → login.epost.ch (Keycloak)          click "Login mit SwissID"
+//     → login.swissid.ch/login/login-email  enter the account e-mail, "Weiter"
+//     → login.swissid.ch/login/login-password  click "Mit Passkey anmelden"
+//     → back to app.epost.ch, authenticated
+// Each step is driven only when its own URL is showing, so the loop simply
+// re-checks where it is; a step that is skipped by the server does no harm.
 async function passkeyLogin(p) {
   const armed = await armPasskey(p);
   if (!armed) return 'no_passkey';
+  const user = process.env.EPOST_SWISSID_USER || armed.cred.username || '';
+  let didSwissId = false, didEmail = false, didPasskey = false;
   try {
     await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    for (let i = 0; i < 24; i++) {
+    let lastSeen = '';
+    for (let i = 0; i < 40; i++) {
       await p.waitForTimeout(2000);
-      if (!(await isLoginPage(p).catch(() => false))) {
-        const u = p.url();
+      const u = p.url();
+      if (DEBUG && u !== lastSeen) { console.error('[passkey]', i, u); lastSeen = u; }
+
+      // Arrived: an authenticated ePost surface.
+      if (/app\.epost\.ch/.test(u) && !/oauth_login|openid-connect/.test(u)) {
         if (u.includes('DigitalLetterboxOverview')
           || await p.locator('div.letter-wrapper').count().catch(() => 0)
           || await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0)) {
@@ -227,11 +244,46 @@ async function passkeyLogin(p) {
           await syncSignCount(armed).catch(() => {});
           return await ensureLetterbox(p);
         }
+      }
+
+      // Station 1 — ePost's own Keycloak page: hand over to SwissID.
+      if (/login\.epost\.ch/.test(u) && !didSwissId) {
+        const sw = p.getByRole('button', { name: /Login mit SwissID/i }).first();
+        if (await sw.count().catch(() => 0)) {
+          await sw.click({ timeout: 8000 }).catch(() => {});
+          didSwissId = true;
+          if (DEBUG) console.error('[passkey] clicked: Login mit SwissID');
+        }
         continue;
       }
-      // On the login screen: surface the passkey option (conditional UI often
-      // fires on its own; clicking is the fallback for an explicit button).
-      await clickPasskeyAffordance(p);
+
+      // Station 2 — SwissID asks which account.
+      if (/login-email/.test(u) && !didEmail) {
+        if (!user) return 'login_required';  // nothing to type; a human is needed
+        const inp = p.locator('input[type=text], input[type=email]').first();
+        if (await inp.count().catch(() => 0)) {
+          await inp.fill(user, { timeout: 8000 }).catch(() => {});
+          const next = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
+          if (await next.count().catch(() => 0)) await next.click({ timeout: 8000 }).catch(() => {});
+          didEmail = true;
+          if (DEBUG) console.error('[passkey] filled e-mail + Weiter');
+        }
+        continue;
+      }
+
+      // Station 3 — password screen, which also offers the passkey. This is
+      // where the virtual authenticator signs, with no user interaction.
+      if (/login-password/.test(u) && !didPasskey) {
+        const pk = p.getByRole('button', { name: /Mit Passkey anmelden|Sign in with (a )?passkey/i }).first();
+        if (await pk.count().catch(() => 0)) {
+          await pk.click({ timeout: 8000 }).catch(() => {});
+          didPasskey = true;
+          if (DEBUG) console.error('[passkey] clicked: Mit Passkey anmelden');
+        } else {
+          await clickPasskeyAffordance(p);
+        }
+        continue;
+      }
     }
     return 'login_required';
   } finally {
