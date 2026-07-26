@@ -8,18 +8,20 @@
 //
 // Env:
 //   EPOST_STATE     storageState json path  (default: ~/.epost-mcp/state.json)
+//   EPOST_PROFILE   persistent browser profile (default: ~/.epost-mcp/profile)
 //   EPOST_CHROMIUM  chromium executable     (default: auto-detect playwright cache)
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { chromium } from 'playwright';
-import { existsSync, readdirSync, mkdirSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const STATE = process.env.EPOST_STATE || join(homedir(), '.epost-mcp', 'state.json');
+const PROFILE = process.env.EPOST_PROFILE || join(homedir(), '.epost-mcp', 'profile');
 const APP_URL = 'https://app.epost.ch';
 
 // --- browser bootstrap ------------------------------------------------------
@@ -49,19 +51,42 @@ let browserObj = null;
 let ctx = null;
 let headed = false;
 
+// Re-seed a fresh context from the cached storageState. A persistent profile
+// drops session cookies when the browser closes, so the two mechanisms cover
+// different halves of the problem — see getContext.
+async function seedFromState(c) {
+  if (!existsSync(STATE)) return;
+  try {
+    const saved = JSON.parse(readFileSync(STATE, 'utf8'));
+    if (saved.cookies?.length) await c.addCookies(saved.cookies).catch(() => {});
+  } catch { /* a corrupt state file just means "log in again" */ }
+}
+
 async function getContext(wantHeaded = false) {
   // Reuse an existing context unless we specifically need a headed one but only
   // have a headless one (the interactive login case).
   if (ctx && (!wantHeaded || headed)) return ctx;
   if (ctx) { await ctx.close().catch(() => {}); ctx = null; }
   if (browserObj) { await browserObj.close().catch(() => {}); browserObj = null; }
-  browserObj = await chromium.launch({ headless: !wantHeaded, executablePath: findChromium() });
-  ctx = await browserObj.newContext({
-    storageState: existsSync(STATE) ? STATE : undefined,
+
+  // A PERSISTENT profile plus the cached storageState, deliberately both:
+  //   - the profile keeps everything a fresh context throws away, notably
+  //     SwissID's "this device is known" state, so an expired session costs a
+  //     password but not a fresh SMS code;
+  //   - storageState carries the session cookies, which a persistent profile
+  //     drops on close.
+  // v0.3.0 replaced the profile with storageState alone, which is why every
+  // expiry meant the full two-factor dance again.
+  mkdirSync(PROFILE, { recursive: true });
+  ctx = await chromium.launchPersistentContext(PROFILE, {
+    headless: !wantHeaded,
+    executablePath: findChromium(),
     acceptDownloads: true,
     locale: 'de-CH',
     viewport: { width: 1400, height: 1000 },
   });
+  browserObj = null;              // a persistent context owns its browser
+  await seedFromState(ctx);
   headed = wantHeaded;
   return ctx;
 }
