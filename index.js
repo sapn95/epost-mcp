@@ -505,7 +505,7 @@ async function createFolder(p, name) {
 // My-Documents datascroller, or by a text substring (e.g. a date "30.05.2025").
 // Pick the lowest on-screen match for both the folder option and the Move
 // button, since the bottom sheet renders below the (dimmed) folder tiles.
-async function moveToFolder(p, { index, title, folder }) {
+async function moveToFolder(p, { index, title, folder, add = true, remove = null }) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
   await p.waitForTimeout(2000);
@@ -549,24 +549,41 @@ async function moveToFolder(p, { index, title, folder }) {
   // is dangerous for bulk filing — ticking an already-member folder would REMOVE
   // it — so this is idempotent: only tick when not already a member, and no-op
   // (close the sheet unchanged) when the document is already filed there.
-  const picked = await p.evaluate((folderName) => {
+  const picked = await p.evaluate(({ folderName, add, removeName }) => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-    const bc = [...document.querySelectorAll('.brand-container')].find(c => clean(c.innerText) === folderName && c.offsetParent !== null);
+    const boxFor = name => [...document.querySelectorAll('.brand-container')]
+      .find(c => clean(c.innerText) === name && c.offsetParent !== null);
+    // The box is a toggle, so clicking is only correct when the current state
+    // differs from the state we want. Ticking an existing membership would
+    // silently REMOVE it, and vice versa.
+    const toggle = (bc, want) => {
+      const box = bc.querySelector('.ui-chkbox-box');
+      const on = box ? box.classList.contains('ui-state-active') : false;
+      const tgt = box || bc.querySelector('.folder-wrapper') || bc;
+      tgt.scrollIntoView({ block: 'center', inline: 'center' });
+      const click = want ? !on : on;
+      if (click) tgt.click();
+      return { on, click };
+    };
+    const bc = boxFor(folderName);
     if (!bc) return { ok: false };
-    const box = bc.querySelector('.ui-chkbox-box');
-    const already = box ? box.classList.contains('ui-state-active') : false;
-    const tgt = box || bc.querySelector('.folder-wrapper') || bc;
-    tgt.scrollIntoView({ block: 'center', inline: 'center' });
-    if (!already) tgt.click();
-    return { ok: true, already };
-  }, folder);
+    const main = toggle(bc, add);
+    // Re-filing: drop the old membership in the SAME sheet. Doing it alone
+    // would leave an empty folder set, which the portal refuses to commit.
+    let removed = null;
+    if (removeName && removeName !== folderName) {
+      const rc = boxFor(removeName);
+      if (rc) removed = toggle(rc, false).click;
+    }
+    return { ok: true, already: main.on, changed: main.click || !!removed, removed };
+  }, { folderName: folder, add, removeName: remove });
   if (!picked.ok) throw new Error(`folder "${folder}" not offered in the move sheet`);
   await p.waitForTimeout(600);
 
-  if (picked.already) {
+  if (!picked.changed) {
     const cancel = p.locator('[id$=":cancel"]').first();
     if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
-    return { status: 'ok', folder, already_in_folder: true };
+    return { status: 'ok', folder, unchanged: true, in_folder: picked.already };
   }
 
   // Confirm with the sheet's Move button (own id ":moveBtn"; aria-disabled can
@@ -588,9 +605,28 @@ async function moveToFolder(p, { index, title, folder }) {
   return { status: 'ok', moved: { index, title, folder } };
 }
 
+// Did the relying party accept the freshly created credential? Returns
+// 'accepted' | 'rejected' | 'unknown'. The registration page navigates to
+// .../register-passkey-error when the server says no.
+async function waitForRegistrationVerdict(p, ms = 45000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const u = p.url();
+    if (/register-passkey-error|error/i.test(u)) return 'rejected';
+    if (!/register-passkey/i.test(u)) return 'accepted';   // moved on = stored
+    if (await p.getByText(/nicht geklappt|fehlgeschlagen|failed|error/i).count().catch(() => 0)) return 'rejected';
+    await p.waitForTimeout(1500);
+  }
+  return 'unknown';
+}
+
 // One-time interactive enrolment: opens a headed window with a virtual
 // authenticator already attached, waits while YOU add a passkey in the SwissID
 // security settings, then exports the created credential to the keychain.
+//
+// NOTE: against SwissID this cannot succeed — see waitForRegistrationVerdict.
+// The tools are kept because the mechanism is sound for relying parties that
+// accept software authenticators; SwissID is not one of them.
 async function passkeyRegister(p, waitMs = 480000) {
   const { cdp, ids } = await attachAuthenticator(p);
   try {
@@ -600,6 +636,21 @@ async function passkeyRegister(p, waitMs = 480000) {
     while (Date.now() < deadline) {
       const c = await findCredential(cdp, ids);
       if (c?.credentialId && c?.privateKey) {
+        // A key in the authenticator only means the KEY was made. The relying
+        // party still has to accept the attestation and store it on the account,
+        // and SwissID rejects software authenticators outright:
+        //   POST /api-login/authenticate/webauthn-register -> HTTP 400
+        //   -> /login/register-passkey-error
+        // Never report success on the local key alone — wait for the verdict.
+        const verdict = await waitForRegistrationVerdict(p);
+        if (verdict !== 'accepted') {
+          return {
+            status: 'rejected',
+            message: 'The key was created locally but the identity provider refused to register it '
+              + '(SwissID requires attested hardware authenticators). Nothing was stored.',
+            page: p.url(),
+          };
+        }
         keychainWrite(KC_SERVICE, JSON.stringify({
           credentialId: c.credentialId,
           rpId: c.rpId,
@@ -655,7 +706,8 @@ const TOOLS = [
   { name: 'epost_list_storage', description: 'List the user\'s custom folders (name + document count) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_storage_documents', description: 'List the individual documents in Storage (index, date, and "Stored in <folder>" tag if filed). Pass scroll_all=true to lazy-load every card before listing.', inputSchema: { type: 'object', properties: { scroll_all: { type: 'boolean', description: 'wheel-scroll until all cards are loaded (default false)' } } } },
   { name: 'epost_create_folder', description: 'Create a new custom folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
-  { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
+  { name: 'epost_unfile_from_folder', description: 'Remove a Storage document from a folder. NOTE: the portal will not commit an empty folder set, so this only works when the document is in more than one folder; to empty a folder that holds the document\'s only membership, use epost_move_to_folder with remove_from instead.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
+  { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
 ];
 
 const server = new Server({ name: 'epost-mcp', version: '0.5.0' }, { capabilities: { tools: {} } });
@@ -762,8 +814,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       if (out.status && out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
+    if (name === 'epost_unfile_from_folder') {
+      const out = await moveToFolder(p, { index: args.index, title: args.title, folder: args.folder, add: false });
+      await saveState();
+      if (out.status && out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      return text(out);
+    }
     if (name === 'epost_move_to_folder') {
-      const out = await moveToFolder(p, { index: args.index, title: args.title, folder: args.folder });
+      const out = await moveToFolder(p, { index: args.index, title: args.title, folder: args.folder, remove: args.remove_from || null });
       await saveState();
       if (out.status && out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
