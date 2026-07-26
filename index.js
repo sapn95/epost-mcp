@@ -391,20 +391,28 @@ async function listStorage(p) {
 // lazy-loads, so pass scroll_all=true to wheel-scroll until every card is in
 // the DOM. Each card only exposes "Scanned Letter" + a date (+ a "Stored in
 // <folder>" tag once filed), so that is all we can report per document.
+// Wheel-scroll the Storage datascroller until it stops adding cards, so every
+// document is in the DOM. Anything addressing a document BY INDEX must do this
+// first: the indices reported by listStorageDocuments(scrollAll) cover all 98
+// documents, while a freshly opened Storage view only has the first batch —
+// addressing index 80 against that view fails as "out of range".
+async function loadAllCards(p) {
+  const cards = p.locator('div.letter-wrapper');
+  let stable = 0;
+  for (let i = 0; i < 40 && stable < 3; i++) {
+    const before = await cards.count();
+    await p.mouse.wheel(0, 6000);
+    await p.waitForTimeout(1000);
+    stable = (await cards.count()) === before ? stable + 1 : 0;
+  }
+  return cards.count();
+}
+
 async function listStorageDocuments(p, { scrollAll = false } = {}) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
   await p.waitForTimeout(2000);
-  const cards = p.locator('div.letter-wrapper');
-  if (scrollAll) {
-    let stable = 0;
-    for (let i = 0; i < 40 && stable < 3; i++) {
-      const before = await cards.count();
-      await p.mouse.wheel(0, 6000);
-      await p.waitForTimeout(1000);
-      stable = (await cards.count()) === before ? stable + 1 : 0;
-    }
-  }
+  if (scrollAll) await loadAllCards(p);
   const docs = await p.$$eval('div.letter-wrapper', els => els.map((el, i) => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
     const dates = [...el.innerText.matchAll(/\d{2}\.\d{2}\.\d{4}/g)].map(m => m[0]);
@@ -449,6 +457,10 @@ async function moveToFolder(p, { index, title, folder }) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
   await p.waitForTimeout(2000);
+  // Indices come from listStorageDocuments(scroll_all), which sees every card;
+  // a freshly opened Storage view only holds the first lazy-loaded batch, so
+  // load the rest before resolving one by position.
+  await loadAllCards(p);
 
   // Resolve the target document card (Storage documents are div.letter-wrapper).
   const cards = p.locator('div.letter-wrapper');
