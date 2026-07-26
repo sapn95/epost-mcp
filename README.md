@@ -62,17 +62,25 @@ the login automatically. The mechanism itself works — it was verified end to e
 against a local relying party: key created, private key exported, and a brand
 new browser context signed a valid assertion with no user interaction.
 
-**SwissID refuses it.** Enrolment reaches the server and comes back:
+**SwissID refuses it**, and says exactly why. Its registration page asks for
+
+```json
+{ "attestation": "indirect",
+  "authenticatorSelection": { "userVerification": "required", "requireResidentKey": true } }
+```
+
+the key is created fine every time, and then the server answers:
 
 ```
-POST https://login.swissid.ch/api-login/authenticate/webauthn-register  ->  400
-     https://login.swissid.ch/login/register-passkey-error
+POST /api-login/authenticate/webauthn-register  ->  400
+ERROR::WebauthnVendorNotAllowed: This webauthn passkey authenticator vendor is not allowed by SwissID
 ```
 
-SwissID requires an *attested hardware* authenticator (Touch ID, YubiKey, ...)
-and rejects software ones by design. That is an anti-fraud control on the
-identity provider's side, so there is nothing to fix on this end, and working
-around it is not something this project attempts.
+So SwissID validates the attestation's **AAGUID** — the authenticator's vendor
+id — against an allow-list of approved hardware makers. A virtual authenticator
+is not on that list. Getting past it would mean forging a listed vendor's
+identity, which is precisely the control being enforced; this project does not
+attempt that.
 
 Note also that a *real* Touch ID passkey does not help either: a platform
 authenticator requires genuine user presence, which an automated browser cannot
