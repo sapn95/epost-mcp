@@ -9,13 +9,15 @@
 // Env:
 //   EPOST_STATE     storageState json path  (default: ~/.epost-mcp/state.json)
 //   EPOST_PROFILE   persistent browser profile (default: ~/.epost-mcp/profile)
-//   EPOST_CHROMIUM  chromium executable     (default: auto-detect playwright cache)
+//   EPOST_BROWSER   chrome | chrome-canary | edge | brave | chromium | abs. path
+//   EPOST_SWISSID_USER  account e-mail (or keychain epost-mcp-swissid-user)
+//   EPOST_DEBUG     1 = trace the login steps on stderr
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { chromium } from 'playwright';
-import { existsSync, readdirSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -26,11 +28,43 @@ const APP_URL = 'https://app.epost.ch';
 
 // --- browser bootstrap ------------------------------------------------------
 
+// Which browser to drive. This matters for more than taste: Playwright's own
+// Chromium is an unsigned test build with no access to the macOS platform
+// authenticator — it reports isUserVerifyingPlatformAuthenticatorAvailable()
+// === false, so Touch ID is never offered and SwissID falls back to password
+// plus SMS. An installed, signed browser reports true and can reach the Secure
+// Enclave, which is what makes the assisted passkey login possible.
+const BROWSERS = {
+  chrome: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  'chrome-canary': '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+  edge: '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  brave: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+};
+const BROWSER_ORDER = ['chrome', 'chrome-canary', 'edge', 'brave'];
+
+// What we settled on and why — reported by epost_settings.
+let browserChoice = { path: undefined, key: null, reason: '' };
+
 function findChromium() {
-  if (process.env.EPOST_CHROMIUM) return process.env.EPOST_CHROMIUM;
+  const pick = (path, key, reason) => { browserChoice = { path, key, reason }; return path; };
+
+  // 1. Explicit choice: a key from BROWSERS, or an absolute path.
+  const want = process.env.EPOST_BROWSER || process.env.EPOST_CHROMIUM;
+  if (want && want !== 'chromium') {
+    const path = BROWSERS[want] || want;
+    if (!existsSync(path)) throw new Error(`EPOST_BROWSER="${want}" not found (looked at ${path})`);
+    return pick(path, BROWSERS[want] ? want : 'custom', 'EPOST_BROWSER');
+  }
+  // 2. Otherwise prefer a signed system browser, so passkeys stay possible.
+  if (!want) {
+    for (const key of BROWSER_ORDER) {
+      if (existsSync(BROWSERS[key])) return pick(BROWSERS[key], key, 'signed system browser (passkey-capable)');
+    }
+  }
+  // 3. Fall back to Playwright's Chromium: fine for everything but passkeys.
   try {
     const p = chromium.executablePath();
-    if (p && existsSync(p)) return p;
+    if (p && existsSync(p)) return pick(p, 'chromium', 'bundled Chromium — no Touch ID support');
   } catch { /* fall through to cache scan */ }
   const cache = join(homedir(), 'Library', 'Caches', 'ms-playwright');
   if (existsSync(cache)) {
@@ -78,13 +112,26 @@ async function getContext(wantHeaded = false) {
   // v0.3.0 replaced the profile with storageState alone, which is why every
   // expiry meant the full two-factor dance again.
   mkdirSync(PROFILE, { recursive: true });
-  ctx = await chromium.launchPersistentContext(PROFILE, {
+  const launch = () => chromium.launchPersistentContext(PROFILE, {
     headless: !wantHeaded,
     executablePath: findChromium(),
     acceptDownloads: true,
     locale: 'de-CH',
     viewport: { width: 1400, height: 1000 },
   });
+  try {
+    ctx = await launch();
+  } catch (e) {
+    // A browser that was killed rather than closed leaves SingletonLock behind,
+    // and Chrome then refuses to start at all ("Failed to create a
+    // ProcessSingleton for your profile directory"). Every later call fails the
+    // same way until the file goes, so clear the stale lock and retry once.
+    if (!/ProcessSingleton|SingletonLock/.test(e.message || '')) throw e;
+    for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try { rmSync(join(PROFILE, f), { force: true }); } catch { /* nothing to clear */ }
+    }
+    ctx = await launch();
+  }
   browserObj = null;              // a persistent context owns its browser
   await seedFromState(ctx);
   headed = wantHeaded;
@@ -630,6 +677,80 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   return { status: 'ok', moved: { index, title, folder } };
 }
 
+// The SwissID account e-mail, used to skip the "which account?" step.
+function swissIdUser() {
+  return process.env.EPOST_SWISSID_USER || keychainRead('epost-mcp-swissid-user') || '';
+}
+
+// Assisted login: drive every step of the SwissID chain that does NOT need a
+// human, and stop at the one that does — the biometric prompt.
+//
+//   app.epost.ch → login.epost.ch    click "Login mit SwissID"
+//                → login-email        fill the account e-mail, "Weiter"
+//                → confirm-passkey    "Weiter"  → macOS asks for Touch ID
+//                → (login-password)   fallback: "Mit Passkey anmelden"
+//                → app.epost.ch, authenticated
+//
+// This is the practical answer to unattended login being impossible: a passkey
+// cannot be used without genuine user presence, but everything around it can be
+// automated, so an expired session costs one fingerprint instead of an e-mail,
+// a password and an SMS code. Needs a signed browser — see findChromium.
+async function assistedLogin(p, waitMs = 300000) {
+  const user = swissIdUser();
+  await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  await p.bringToFront().catch(() => {});
+
+  const deadline = Date.now() + waitMs;
+  const done = new Set();
+  let lastSeen = '';
+  const once = async (step, action) => {
+    if (done.has(step)) return false;
+    done.add(step);
+    if (DEBUG) console.error('[login]', step);
+    await action();
+    return true;
+  };
+
+  while (Date.now() < deadline) {
+    await p.waitForTimeout(1500);
+    const u = p.url();
+    if (DEBUG && u !== lastSeen) { console.error('[login] at', u.slice(0, 90)); lastSeen = u; }
+
+    if (/app\.epost\.ch/.test(u) && !/oauth_login|openid-connect/.test(u)
+      && (u.includes('DigitalLetterboxOverview')
+        || await p.locator('div.letter-wrapper').count().catch(() => 0)
+        || await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0))) {
+      return await ensureLetterbox(p);
+    }
+    if (/login\.epost\.ch/.test(u) && await once('swissid', async () => {
+      const b = p.getByRole('button', { name: /Login mit SwissID/i }).first();
+      if (await b.count().catch(() => 0)) await b.click({ timeout: 8000 }).catch(() => {});
+    })) continue;
+
+    if (/login-email/.test(u) && user && await once('email', async () => {
+      const i = p.locator('input[type=text], input[type=email]').first();
+      if (await i.count().catch(() => 0)) {
+        await i.fill(user, { timeout: 8000 }).catch(() => {});
+        const n = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
+        if (await n.count().catch(() => 0)) await n.click({ timeout: 8000 }).catch(() => {});
+      }
+    })) continue;
+
+    // Clicking Weiter here raises the Touch ID sheet — the one step only the
+    // human can finish.
+    if (/confirm-passkey/.test(u) && await once('confirm', async () => {
+      const n = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
+      if (await n.count().catch(() => 0)) await n.click({ timeout: 8000 }).catch(() => {});
+    })) continue;
+
+    if (/login-password/.test(u) && await once('offer-passkey', async () => {
+      const b = p.getByRole('button', { name: /Mit Passkey anmelden|passkey/i }).first();
+      if (await b.count().catch(() => 0)) await b.click({ timeout: 8000 }).catch(() => {});
+    })) continue;
+  }
+  return 'login_required';
+}
+
 // Did the relying party accept the freshly created credential? Returns
 // 'accepted' | 'rejected' | 'unknown'. The registration page navigates to
 // .../register-passkey-error when the server says no.
@@ -706,6 +827,92 @@ async function ensureSession(p) {
   return st === 'no_passkey' ? 'login_required' : st;
 }
 
+
+// Move a letter out of the inbox into Storage ("Store" in the card menu). This
+// is the archive action: unlike Delete it keeps the document, it just stops
+// cluttering the inbox. Letters are addressed the same way as elsewhere — by
+// list index, or by a text substring such as a date.
+async function storeLetter(p, { index, title, folder }) {
+  const st = await ensureSession(p);
+  if (st !== 'ok') return { status: st };
+  // Storing re-renders the list, and a menu or overlay left over from the
+  // previous call silently swallows the next click ("locator.click: Timeout").
+  // Start every store from a freshly rendered overview instead.
+  await p.keyboard.press('Escape').catch(() => {});
+  await p.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  await p.waitForTimeout(2500);
+  const cards = p.locator('div.letter-wrapper');
+  await cards.first().waitFor({ state: 'visible', timeout: 20000 }).catch(() => {});
+  let card = null;
+  if (typeof index === 'number') {
+    if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} letters)`);
+    card = cards.nth(index);
+  } else if (title) {
+    card = p.locator('div.letter-wrapper', { hasText: title }).first();
+    if (!(await card.count())) throw new Error(`no letter matching "${title}"`);
+  } else throw new Error('pass either index or title');
+
+  const label = (await card.innerText().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 80);
+  await card.scrollIntoViewIfNeeded().catch(() => {});
+  const menu = card.locator('.letter-action-menu').first();
+  if (!(await menu.count())) throw new Error('action menu ("...") not found on the letter');
+  await menu.click({ timeout: 8000 });
+  await p.waitForTimeout(1000);
+  if (!(await clickVisibleByText(p, 'Store'))) throw new Error('"Store" menu item did not become visible');
+  await p.waitForTimeout(2200);
+
+  // Store is TWO steps. The menu item only opens a "Select a folder" sheet with
+  // one checkbox per folder and its own Store button, greyed out until a folder
+  // is ticked. Clicking the menu item and stopping leaves that sheet open: the
+  // call looks successful, nothing is archived, and the open overlay swallows
+  // every later click.
+  // Scope the tile lookup to the SHEET. `.brand-container` also matches letter
+  // cards in the list behind it, so a document-wide scan reads the inbox instead
+  // of the folder tiles — and reports the letter's own text as an offered
+  // "folder". Wait until the sheet actually holds tiles before reading.
+  const sheet = p.locator('[id*="storage-folder-selection"]').first();
+  await sheet.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+  await sheet.locator('.brand-container').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+  const picked = await sheet.evaluate((root, folderName) => {
+    // Normalise: macOS and the portal disagree on whether "ä" is one code point
+    // or "a" plus a combining diaeresis, and a byte-exact compare then fails on
+    // a folder name that looks identical on screen.
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim().normalize('NFC');
+    // The tiles sit in a horizontally scrolling strip, so the ones off to the
+    // right are not "visible" — filtering on offsetParent silently hides half
+    // the folders and the target looks unavailable. Take them all and scroll
+    // the wanted one into view before clicking.
+    const tiles = [...root.querySelectorAll('.brand-container')];
+    const offered = tiles.map(c => clean(c.innerText));
+    const want = folderName.normalize('NFC');
+    const bc = tiles.find(c => clean(c.innerText) === want)
+      || tiles.find(c => clean(c.innerText).toLowerCase() === want.toLowerCase());
+    if (!bc) return { ok: false, offered };
+    bc.scrollIntoView({ block: 'center', inline: 'center' });
+    const box = bc.querySelector('.ui-chkbox-box');
+    // Checkboxes are toggles: only click when the state differs from what we want.
+    if (!(box && box.classList.contains('ui-state-active'))) (box || bc).click();
+    return { ok: true, offered };
+  }, folder);
+  if (!picked.ok) {
+    const cancel = p.locator('[id$=":cancel"]').first();
+    if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
+    throw new Error(`folder "${folder}" not in the store sheet. Offered: ${picked.offered.join(' | ')}`);
+  }
+  await p.waitForTimeout(700);
+
+  // Confirm with the sheet's own Store button. aria-disabled lags behind the
+  // real state once a folder is ticked, so force the click.
+  const confirm = sheet.getByText('Store', { exact: true }).last();
+  if (await confirm.count().catch(() => 0)) {
+    await confirm.click({ timeout: 8000, force: true }).catch(() => {});
+  } else if (!(await clickVisibleByText(p, 'Store'))) {
+    throw new Error('store confirm button not found in the sheet');
+  }
+  await p.waitForTimeout(3000);
+  return { status: 'ok', stored: label, folder };
+}
+
 // Click the first VISIBLE element whose exact text is `t`.
 async function clickVisibleByText(p, t) {
   const loc = p.getByText(t, { exact: true });
@@ -721,13 +928,15 @@ async function clickVisibleByText(p, t) {
 
 const TOOLS = [
   { name: 'epost_status', description: 'Check whether the ePost session is alive (ok) or an interactive SwissID login is needed (login_required).', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_login', description: 'Open a VISIBLE browser window on app.epost.ch so you can complete the SwissID login (incl. 2FA). Waits up to 8 minutes, then caches the session to disk.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_login', description: 'Open a VISIBLE browser window and drive the whole SwissID login except the biometric prompt: it goes to SwissID, fills the account e-mail and requests the passkey, so you only confirm with Touch ID. Falls back to a normal manual login. Caches the session afterwards.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 300)' } } } },
+  { name: 'epost_settings', description: 'Show the resolved configuration: which browser is driven and why, whether it can use Touch ID passkeys, the profile/state paths, and whether the SwissID account e-mail is configured.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_passkey_status', description: 'Report whether a software passkey is enrolled for hands-free SwissID re-login.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_passkey_register', description: 'ONE-TIME: open a visible window with a virtual FIDO2 authenticator attached; add a passkey in your SwissID security settings and the credential is exported to the macOS keychain. Afterwards expired sessions re-login automatically, with no Touch ID or SMS code. SECURITY: this key is software-held and exportable — it trades phishing-resistance for automation.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 480)' } } } },
   { name: 'epost_passkey_forget', description: 'Delete the locally stored passkey from the macOS keychain (also remove it in the SwissID account settings to fully revoke).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
+  { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
   { name: 'epost_list_storage', description: 'List the user\'s custom folders (name + document count) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_storage_documents', description: 'List the individual documents in Storage (index, date, and "Stored in <folder>" tag if filed). Pass scroll_all=true to lazy-load every card before listing.', inputSchema: { type: 'object', properties: { scroll_all: { type: 'boolean', description: 'wheel-scroll until all cards are loaded (default false)' } } } },
   { name: 'epost_create_folder', description: 'Create a new custom folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
@@ -735,7 +944,7 @@ const TOOLS = [
   { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
 ];
 
-const server = new Server({ name: 'epost-mcp', version: '0.5.0' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'epost-mcp', version: '0.7.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
@@ -765,34 +974,47 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_login') {
       const p = await getPage(true);
-      await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await p.bringToFront().catch(() => {});
-      // Wait (up to 8 min) until the user has ACTUALLY authenticated. Success is
-      // signalled by a real authenticated surface — the letterbox itself or the
-      // dashboard's "Digital Letterbox" entry — NOT merely being on app.epost.ch
-      // (the pre-redirect and login pages also live under that host, which made
-      // the old waitForURL predicate resolve instantly without waiting).
-      // We only OBSERVE here (no re-navigation), so a half-entered SwissID form
-      // is never disrupted; and we require two consecutive positive polls so a
-      // brief app-shell flash before a redirect to login can't false-positive.
-      const deadline = Date.now() + 480000;
-      let authed = false, hits = 0;
-      while (Date.now() < deadline) {
-        let ok = false;
-        if (!(await isLoginPage(p).catch(() => false))) {
-          const u = p.url();
-          ok = u.includes('DigitalLetterboxOverview')
-            || !!(await p.locator('div.letter-wrapper').count().catch(() => 0))
-            || !!(await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0));
-        }
-        hits = ok ? hits + 1 : 0;
-        if (hits >= 2) { authed = true; break; }
-        await p.waitForTimeout(2500);
-      }
-      // Now that we're authenticated it's safe to navigate into the letterbox.
-      const status = authed ? await ensureLetterbox(p) : 'login_required';
+      const status = await assistedLogin(p, Math.max(30, Number(args.wait_seconds) || 300) * 1000);
       await saveState();
-      return text({ status, message: status === 'ok' ? `Login OK — session cached to ${STATE}` : 'Login not completed in time; run epost_login again.' });
+      const passkeyCapable = browserChoice.key && browserChoice.key !== 'chromium';
+      return text({
+        status,
+        browser: browserChoice.key,
+        message: status === 'ok'
+          ? `Login OK — session cached to ${STATE}`
+          : (passkeyCapable
+            ? 'Not completed in time. The window drives everything except the biometric prompt — confirm that with Touch ID.'
+            : 'Not completed in time. NOTE: the bundled Chromium cannot use Touch ID; set EPOST_BROWSER=chrome for a one-touch login.'),
+      });
+    }
+    if (name === 'epost_settings') {
+      const p = await getPage();
+      const uvpaa = await p.evaluate(() =>
+        PublicKeyCredential?.isUserVerifyingPlatformAuthenticatorAvailable?.().catch(() => false)).catch(() => 'unknown');
+      const user = swissIdUser();
+      // The probe usually runs in the headless context, which has no biometric
+      // UI and so always answers false. That says nothing about the headed
+      // window epost_login opens, which is where Touch ID actually happens —
+      // reporting the raw false here would be plain wrong.
+      const signedBrowser = browserChoice.key && browserChoice.key !== 'chromium';
+      const touchId = uvpaa === true ? 'available'
+        : headed ? 'NOT available in this browser — login falls back to password + SMS'
+          : signedBrowser
+            ? `not probeable headless; expected to work in the headed login window (${browserChoice.key} is signed)`
+            : 'NOT available — the bundled Chromium cannot reach the platform authenticator; set EPOST_BROWSER=chrome';
+      return text({
+        browser: { key: browserChoice.key, path: browserChoice.path, chosen_because: browserChoice.reason },
+        touch_id_passkeys: touchId,
+        swissid_user: user ? user.replace(/^(.).*(@.*)$/, '$1***$2') : 'not set — epost_login cannot skip the e-mail step',
+        paths: { state: STATE, profile: PROFILE },
+        settings: {
+          EPOST_BROWSER: 'chrome | chrome-canary | edge | brave | chromium | /absolute/path',
+          EPOST_SWISSID_USER: 'account e-mail (or macOS keychain item "epost-mcp-swissid-user")',
+          EPOST_STATE: 'cached session file',
+          EPOST_PROFILE: 'persistent browser profile',
+          EPOST_DEBUG: '1 to trace the login steps on stderr',
+        },
+      });
     }
 
     const p = await getPage();
@@ -820,6 +1042,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       for (const l of letters) saved.push(await downloadLetter(p, l.index, args.output_dir, l));
       await saveState();
       return text({ count: saved.length, saved });
+    }
+    if (name === 'epost_store_letter') {
+      if (!args.folder) throw new Error('folder is required — the Store sheet will not commit without one');
+      const out = await storeLetter(p, { index: args.index, title: args.title, folder: args.folder });
+      await saveState();
+      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      return text(out);
     }
     if (name === 'epost_list_storage') {
       const out = await listStorage(p);
