@@ -64,6 +64,65 @@ First-time / after-expiry flow:
 > this repo and must **never** be committed, shared, or synced to a cloud folder.
 > Delete it to force a fresh login. Override its location with `EPOST_STATE`.
 
+## Transport: the public API, with the browser as fallback
+
+ePost publishes a REST API for the Digital Letterbox, and **a private tenant can
+use it** — which is easy to miss, because the developer portal is written for
+business clients. The API is preferred for everything it covers; browser
+automation runs only when it cannot serve a call.
+
+Set it up once:
+
+1. Log in to app.epost.ch with SwissID as usual.
+2. In the **same browser**, open `https://login.epost.ch/auth/realms/klara/account/`
+   → *Authentication* → *Set/update password*, and set one. A SwissID login has
+   no password of its own, which is the whole point of this step.
+3. Store it: `security add-generic-password -a epost -s epost-mcp-api-password -w '<password>' -U`
+   (or set `EPOST_API_PASSWORD`). The account e-mail comes from the same place as
+   before.
+
+Documented at
+[How to access the letterbox public APIs with a private tenant](https://developer.epost.ch/docs/api-docs/v6nqmmjkxcery-how-to-access-the-letterbox-public-ap-is-with-a-private-tenant).
+
+### Why it is worth it
+
+Measured against the same account:
+
+| | Browser | API |
+| --- | --- | --- |
+| List the inbox | tens of seconds, needs a live session | ~2s, no session at all |
+| What a letter says | `Gescannter Brief` for every scan | a real `description` ("Invoice from …") and `documentTypes` |
+| Storage listing | 48 cards at a time, scrolled | every document in one call |
+| Archiving | two-step folder sheet | one `PATCH` |
+
+That second row is the one that matters: the portal renders every scan with the
+same title, so an archived document could not be classified without opening it.
+The API has carried the sender all along.
+
+### What the API does not do
+
+There is **no endpoint to move a document that is already in Storage** between
+folders. `PATCH /letters/{id}/archive` is inbox → folder only and answers `400`
+for anything already archived — the documentation says so explicitly. Re-filing
+therefore falls back to the browser.
+
+A useful division follows from that: **the browser acts, the API verifies.**
+After a browser move, the API reports exactly which document id ended up in
+which folder — which matters because Storage cards show only a date, and dates
+repeat.
+
+### Auth model
+
+```
+POST /core/latest/tenants   {username, password}                     -> tenant_id, company_id
+POST /core/latest/token     {username, password, grant_type=password,
+                             tenant_id, company_id}                  -> access_token (600s)
+GET  /epost/v2/letters      Authorization: Bearer …
+```
+
+The server re-authenticates a minute before expiry rather than tracking refresh
+tokens: the password is already at hand, so a refresh buys nothing.
+
 ## Login: one fingerprint, nothing else
 
 `epost_login` drives every step of the SwissID chain that does not need a human
