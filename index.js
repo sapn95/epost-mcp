@@ -17,7 +17,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { chromium } from 'playwright';
-import { existsSync, readdirSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -379,6 +379,151 @@ async function syncSignCount(armed) {
   }
   keychainWrite(KC_SERVICE, JSON.stringify({ ...armed.cred, signCount: best }));
 }
+
+
+// --- public API (preferred transport) ---------------------------------------
+//
+// ePost publishes a documented REST API for the Digital Letterbox, and a private
+// tenant can use it: set a password once on the Keycloak account
+// (login.epost.ch/auth/realms/klara/account/ -> Authentication -> set password)
+// and authenticate with e-mail + password. See
+// https://developer.epost.ch/docs/api-docs/v6nqmmjkxcery-how-to-access-the-letterbox-public-ap-is-with-a-private-tenant
+//
+// This is strictly better than driving the portal: the listing carries a real
+// `description` ("Invoice from ...") and `documentTypes` instead of the
+// uniform "Gescannter Brief" the UI shows, archiving is one PATCH instead of a
+// two-step folder sheet, and nothing depends on a selector. Browser automation
+// remains as the fallback for whatever the API does not cover, and for when it
+// is unavailable.
+//
+// Auth chain (both documented):
+//   POST /core/latest/tenants  {username,password}                -> tenant_id, company_id
+//   POST /core/latest/token    {username,password,grant_type=password,tenant_id,company_id}
+//                                                                  -> access_token (600s)
+
+const API_BASE = process.env.EPOST_API_BASE || 'https://api.epost.ch';
+const KC_API_PASSWORD = 'epost-mcp-api-password';
+
+let apiToken = null;          // { value, expiresAt, tenant }
+let apiUnavailable = null;    // why the API cannot be used, once known
+
+function apiCredentials() {
+  const user = swissIdUser();
+  const password = process.env.EPOST_API_PASSWORD || keychainRead(KC_API_PASSWORD);
+  return user && password ? { user, password } : null;
+}
+
+async function apiFetch(method, path, { params, form, token, raw } = {}) {
+  const url = new URL(path, API_BASE);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+  }
+  const headers = { Accept: 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  let body;
+  if (form) {
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    body = new URLSearchParams(form).toString();
+  }
+  const res = await fetch(url, { method, headers, body });
+  if (!res.ok) {
+    const detail = (await res.text().catch(() => '')).slice(0, 200);
+    const err = new Error(`${method} ${path} -> ${res.status}${detail ? ` ${detail}` : ''}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (raw) return Buffer.from(await res.arrayBuffer());
+  if (res.status === 204) return null;
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// A token lasts 600s. Re-authenticate slightly early rather than tracking the
+// refresh token: the password is already at hand, so a refresh buys nothing.
+async function apiAuth() {
+  if (apiToken && Date.now() < apiToken.expiresAt) return apiToken.value;
+  const creds = apiCredentials();
+  if (!creds) {
+    apiUnavailable = 'no API password configured (keychain item epost-mcp-api-password)';
+    return null;
+  }
+  try {
+    const tenants = await apiFetch('POST', '/core/latest/tenants',
+      { form: { username: creds.user, password: creds.password } });
+    const tenant = (Array.isArray(tenants) ? tenants : [tenants])[0];
+    if (!tenant?.tenant_id) throw new Error('no tenant returned');
+    const tok = await apiFetch('POST', '/core/latest/token', {
+      form: {
+        username: creds.user, password: creds.password, grant_type: 'password',
+        tenant_id: tenant.tenant_id, company_id: tenant.company_id,
+      },
+    });
+    apiToken = {
+      value: tok.access_token,
+      expiresAt: Date.now() + Math.max(30, (tok.expires_in || 600) - 60) * 1000,
+      tenant,
+    };
+    apiUnavailable = null;
+    if (DEBUG) console.error('[api] authenticated, expires_in', tok.expires_in);
+    return apiToken.value;
+  } catch (e) {
+    apiUnavailable = e.message;
+    if (DEBUG) console.error('[api] auth failed:', e.message);
+    return null;
+  }
+}
+
+// Run `fn` against the API; return null if the API cannot serve it, so the
+// caller falls back to the browser instead of failing.
+async function withApi(fn) {
+  const token = await apiAuth();
+  if (!token) return null;
+  try {
+    return await fn(token);
+  } catch (e) {
+    if (e.status === 401) { apiToken = null; }   // expired mid-call: retry once
+    if (e.status === 401 && await apiAuth()) {
+      try { return await fn(apiToken.value); } catch (e2) { apiUnavailable = e2.message; return null; }
+    }
+    apiUnavailable = e.message;
+    if (DEBUG) console.error('[api] call failed:', e.message);
+    return null;
+  }
+}
+
+// Shape one API letter like the browser tools report them, so both transports
+// return the same thing to a client.
+function apiLetterRow(l, i) {
+  return {
+    index: i,
+    id: l.id,
+    sender: l.description || null,          // "Invoice from <sender>" when known
+    title: l.letterTitle || null,
+    documentTypes: l.documentTypes || [],
+    date: (l.receivedDateTime || '').slice(0, 10).split('-').reverse().join('.') || null,
+    receivedDateTime: l.receivedDateTime || null,
+    fileName: l.fileName || null,
+    read: l.readStatus === 'READ',
+    storedIn: l.directoryNames || l.directoryName || undefined,
+  };
+}
+
+const apiListLetters = (limit = 200) => withApi(t => apiFetch('GET', '/epost/v2/letters', {
+  token: t, params: { 'letter-types': 'CLASSIC_LETTER', 'letter-folder': 'INBOX_FOLDER', limit },
+}));
+
+const apiListDirectories = () => withApi(t => apiFetch('GET', '/epost/v2/archives/directories', { token: t }));
+
+const apiListArchive = (directoryId, limit = 1000) => withApi(t => apiFetch('GET', '/epost/v2/archives/letters', {
+  token: t, params: { limit, 'directory-id': directoryId || undefined },
+}));
+
+const apiLetterContent = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}/content`, { token: t, raw: true }));
+
+const apiArchiveLetter = (id, directoryId) => withApi(t => apiFetch('PATCH', `/epost/v2/letters/${id}/archive`, {
+  token: t, params: { 'destination-directory-id': directoryId || undefined },
+}).then(() => true));
+
 
 // --- navigation helpers -----------------------------------------------------
 
@@ -1008,10 +1153,10 @@ const TOOLS = [
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
-  { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
+  { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string', description: 'API letter id (preferred — indices shift)' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
   { name: 'epost_list_storage', description: 'List the user\'s custom folders (name + document count) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_list_storage_documents', description: 'List the individual documents in Storage (index, date, and "Stored in <folder>" tag if filed). Pass scroll_all=true to lazy-load every card before listing.', inputSchema: { type: 'object', properties: { scroll_all: { type: 'boolean', description: 'wheel-scroll until all cards are loaded (default false)' } } } },
-  { name: 'epost_read_storage_document', description: 'Open one Storage document and report what the portal knows about it: the real sender/subject line, document type, date, amount and current folder. The card list only ever shows "Gescannter Brief", so this is the only way to classify an archived document. Pass output_dir to also save the PDF.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, output_dir: { type: 'string', description: 'save the PDF here as well' } } } },
+  { name: 'epost_list_storage_documents', description: 'List the documents in Storage. Over the API each carries a real description ("Invoice from ...") and documentTypes; over the browser fallback only a date and the folder tag. Pass folder_id to list one folder, scroll_all for the browser path.', inputSchema: { type: 'object', properties: { folder_id: { type: 'string', description: 'limit to one folder (API only)' }, limit: { type: 'number' }, scroll_all: { type: 'boolean', description: 'browser fallback: load every card first' } } } },
+  { name: 'epost_read_storage_document', description: 'Open one Storage document and report what the portal knows about it: the real sender/subject line, document type, date, amount and current folder. The card list only ever shows "Gescannter Brief", so this is the only way to classify an archived document. Pass output_dir to also save the PDF.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string' }, folder_id: { type: 'string' }, output_dir: { type: 'string', description: 'save the PDF here as well' } } } },
   { name: 'epost_create_folder', description: 'Create a new custom folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
   { name: 'epost_unfile_from_folder', description: 'Remove a Storage document from a folder. NOTE: the portal will not commit an empty folder set, so this only works when the document is in more than one folder; to empty a folder that holds the document\'s only membership, use epost_move_to_folder with remove_from instead.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
   { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
@@ -1093,6 +1238,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     const p = await getPage();
 
     if (name === 'epost_list_letters') {
+      const viaApi = await apiListLetters(args.limit || 200);
+      if (viaApi) return text({ transport: 'api', count: viaApi.length, letters: viaApi.map(apiLetterRow) });
       const st = await ensureSession(p);
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const out = await listLetters(p);
@@ -1100,6 +1247,20 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       return text(out);
     }
     if (name === 'epost_download_letter') {
+      const apiLetters = await apiListLetters(200);
+      if (apiLetters) {
+        const l = args.letter_id ? apiLetters.find(x => x.id === args.letter_id) : apiLetters[args.index];
+        if (l) {
+          const bytes = await apiLetterContent(l.id);
+          if (bytes) {
+            mkdirSync(args.output_dir, { recursive: true });
+            const stamp = (l.receivedDateTime || '').slice(0, 10) || 'undated';
+            const saved = join(args.output_dir, `${stamp}_ePost_${args.index ?? l.id}.pdf`);
+            writeFileSync(saved, bytes);
+            return text({ transport: 'api', saved, bytes: bytes.length, description: l.description });
+          }
+        }
+      }
       const st = await ensureSession(p);
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const letters = await listLetters(p);
@@ -1118,24 +1279,79 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_store_letter') {
       if (!args.folder) throw new Error('folder is required — the Store sheet will not commit without one');
+      // The API archives in one PATCH; the browser needs the two-step folder
+      // sheet. Resolve the folder name to its id, and address the letter by id.
+      const dirs = await apiListDirectories();
+      if (dirs) {
+        const want = String(args.folder).normalize('NFC').toLowerCase();
+        const dir = dirs.find(d => d.directoryId && (d.directoryName || '').normalize('NFC').toLowerCase() === want);
+        if (!dir) {
+          return text({ error: `folder "${args.folder}" not found`, available: dirs.filter(d => d.directoryId).map(d => d.directoryName) });
+        }
+        const letters = await apiListLetters(200);
+        if (letters) {
+          const l = args.letter_id ? letters.find(x => x.id === args.letter_id)
+            : typeof args.index === 'number' ? letters[args.index]
+              : args.title ? letters.find(x => JSON.stringify(x).includes(args.title)) : null;
+          if (l && await apiArchiveLetter(l.id, dir.directoryId)) {
+            await saveState();
+            return text({ transport: 'api', stored: l.description || l.letterTitle, folder: dir.directoryName, id: l.id });
+          }
+        }
+      }
       const out = await storeLetter(p, { index: args.index, title: args.title, folder: args.folder });
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_list_storage') {
+      const dirs = await apiListDirectories();
+      if (dirs) {
+        return text({
+          transport: 'api',
+          folders: dirs.filter(d => d.directoryId).map(d => ({ name: d.directoryName, count: d.numberOfDocuments, id: d.directoryId })),
+          companyFolders: dirs.filter(d => !d.directoryId).map(d => ({ name: d.directoryName, count: d.numberOfDocuments })),
+        });
+      }
       const out = await listStorage(p);
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_list_storage_documents') {
+      const viaApi = await apiListArchive(args.folder_id, args.limit || 1000);
+      if (viaApi) {
+        const items = Array.isArray(viaApi) ? viaApi : (viaApi.letters || viaApi.content || []);
+        return text({ transport: 'api', count: items.length, documents: items.map(apiLetterRow) });
+      }
       const out = await listStorageDocuments(p, { scrollAll: args.scroll_all === true });
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_read_storage_document') {
+      // Over the API a Storage document is just a letter with an id: the listing
+      // already carries the description, and the same content endpoint serves
+      // the PDF. No card to open, no viewer to drive.
+      const arch = await apiListArchive(args.folder_id, 1000);
+      if (arch) {
+        const items = Array.isArray(arch) ? arch : (arch.letters || arch.content || []);
+        const l = args.letter_id ? items.find(x => x.id === args.letter_id)
+          : typeof args.index === 'number' ? items[args.index]
+            : args.title ? items.find(x => JSON.stringify(x).includes(args.title)) : null;
+        if (l) {
+          let saved = null;
+          if (args.output_dir) {
+            const bytes = await apiLetterContent(l.id);
+            if (bytes) {
+              mkdirSync(args.output_dir, { recursive: true });
+              saved = join(args.output_dir, `${(l.receivedDateTime || '').slice(0, 10) || 'undated'}_ePostStorage_${args.index ?? l.id}.pdf`);
+              writeFileSync(saved, bytes);
+            }
+          }
+          return text({ transport: 'api', ...apiLetterRow(l, args.index ?? 0), saved });
+        }
+      }
       const out = await readStorageDocument(p, { index: args.index, title: args.title, outputDir: args.output_dir });
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
