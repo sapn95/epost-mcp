@@ -11,6 +11,8 @@
 //   EPOST_PROFILE   persistent browser profile (default: ~/.epost-mcp/profile)
 //   EPOST_BROWSER   chrome | chrome-canary | edge | brave | chromium | abs. path
 //   EPOST_SWISSID_USER  account e-mail (or keychain epost-mcp-swissid-user)
+//   EPOST_TRANSPORT auto (default) | api | browser
+//   EPOST_API_PASSWORD  API password (or keychain epost-mcp-api-password)
 //   EPOST_DEBUG     1 = trace the login steps on stderr
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -402,12 +404,16 @@ async function syncSignCount(armed) {
 //                                                                  -> access_token (600s)
 
 const API_BASE = process.env.EPOST_API_BASE || 'https://api.epost.ch';
+// auto (default) = API when it can serve the call, browser otherwise.
+// Forcing one is for diagnosis and for the operations only the browser can do.
+const TRANSPORT = (process.env.EPOST_TRANSPORT || 'auto').toLowerCase();
 const KC_API_PASSWORD = 'epost-mcp-api-password';
 
 let apiToken = null;          // { value, expiresAt, tenant }
 let apiUnavailable = null;    // why the API cannot be used, once known
 
 function apiCredentials() {
+  if (TRANSPORT === 'browser') return null;      // pinned to the browser
   const user = swissIdUser();
   const password = process.env.EPOST_API_PASSWORD || keychainRead(KC_API_PASSWORD);
   return user && password ? { user, password } : null;
@@ -1221,6 +1227,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             ? `not probeable headless; expected to work in the headed login window (${browserChoice.key} is signed)`
             : 'NOT available — the bundled Chromium cannot reach the platform authenticator; set EPOST_BROWSER=chrome';
       return text({
+        transport: TRANSPORT === 'auto' ? (apiCredentials() ? 'auto (API preferred)' : 'auto (browser — no API password set)') : TRANSPORT,
+        api: apiUnavailable ? `unavailable: ${apiUnavailable}` : (apiCredentials() ? 'configured' : 'no password configured'),
         browser: { key: browserChoice.key, path: browserChoice.path, chosen_because: browserChoice.reason },
         touch_id_passkeys: touchId,
         swissid_user: user ? user.replace(/^(.).*(@.*)$/, '$1***$2') : 'not set — epost_login cannot skip the e-mail step',
@@ -1230,6 +1238,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           EPOST_SWISSID_USER: 'account e-mail (or macOS keychain item "epost-mcp-swissid-user")',
           EPOST_STATE: 'cached session file',
           EPOST_PROFILE: 'persistent browser profile',
+          EPOST_TRANSPORT: 'auto (default) | api | browser',
+          EPOST_API_PASSWORD: 'API password (or keychain item "epost-mcp-api-password")',
           EPOST_DEBUG: '1 to trace the login steps on stderr',
         },
       });
