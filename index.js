@@ -431,7 +431,7 @@ function apiCredentials() {
   return user && password ? { user, password } : null;
 }
 
-async function apiFetch(method, path, { params, form, token, raw } = {}) {
+async function apiFetch(method, path, { params, form, json, token, raw } = {}) {
   const url = new URL(path, API_BASE);
   for (const [k, v] of Object.entries(params || {})) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
@@ -444,6 +444,9 @@ async function apiFetch(method, path, { params, form, token, raw } = {}) {
   if (form) {
     headers['Content-Type'] = 'application/x-www-form-urlencoded';
     body = new URLSearchParams(form).toString();
+  } else if (json !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(json);
   }
   const res = await fetch(url, { method, headers, body });
   if (!res.ok) {
@@ -546,6 +549,31 @@ const apiLetterContent = id => withApi(t => apiFetch('GET', `/epost/v2/letters/$
 const apiArchiveLetter = (id, directoryId) => withApi(t => apiFetch('PATCH', `/epost/v2/letters/${id}/archive`, {
   token: t, params: { 'destination-directory-id': directoryId || undefined },
 }).then(() => true));
+
+
+
+// --- the rest of the letterbox API -----------------------------------------
+
+const apiGetLetter = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}`, { token: t }));
+
+// Full-text search across the letters — something the portal never offered us.
+const apiSearch = (q, where = 'ALL', limit = 50) => withApi(t => apiFetch('GET', '/epost/v2/letters/search', {
+  token: t, params: { keyword: q, 'search-location': where, limit },
+}));
+
+const apiUnreadCount = () => withApi(t => apiFetch('GET', '/epost/v2/letters/inbox/count', { token: t }));
+
+const apiSetRead = (ids, status) => withApi(t => apiFetch('POST', '/epost/v2/letters/read', {
+  token: t, json: { letterIds: ids, readStatus: status },
+}).then(() => true));
+
+const apiDeletedLetters = () => withApi(t => apiFetch('GET', '/epost/v2/letters/deleted', { token: t }));
+
+const apiRestoreLetter = id => withApi(t => apiFetch('POST', `/epost/v2/letters/${id}/restore`, { token: t }).then(() => true));
+
+const apiDeleteLetter = id => withApi(t => apiFetch('DELETE', `/epost/v2/letters/${id}`, { token: t }).then(() => true));
+
+const apiThumbnail = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}/thumbnail`, { token: t, raw: true }));
 
 
 // --- navigation helpers -----------------------------------------------------
@@ -1177,6 +1205,14 @@ const TOOLS = [
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
   { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string', description: 'API letter id (preferred — indices shift)' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
+  { name: 'epost_search', description: 'Full-text search across your letters — keywords are matched inside the letter content, not just the metadata. Optionally limit to the inbox or to Storage. API only; there is no equivalent in the portal automation.', inputSchema: { type: 'object', properties: { keyword: { type: 'string' }, location: { type: 'string', enum: ['ALL', 'INBOX', 'STORAGE'], description: 'default ALL' }, limit: { type: 'number' } }, required: ['keyword'] } },
+  { name: 'epost_get_letter', description: 'Get one letter by its id, with the sender description, document types, dates and read status.', inputSchema: { type: 'object', properties: { letter_id: { type: 'string' } }, required: ['letter_id'] } },
+  { name: 'epost_unread_count', description: 'How many unread letters are in the inbox.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_set_read_status', description: 'Mark letters READ or UNREAD by id.', inputSchema: { type: 'object', properties: { letter_ids: { type: 'array', items: { type: 'string' } }, status: { type: 'string', enum: ['READ', 'UNREAD'] } }, required: ['letter_ids', 'status'] } },
+  { name: 'epost_list_deleted', description: 'Letters in the trash, with the days remaining before they are permanently removed.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'epost_restore_letter', description: 'Restore a deleted letter back to the inbox.', inputSchema: { type: 'object', properties: { letter_id: { type: 'string' } }, required: ['letter_id'] } },
+  { name: 'epost_delete_letter', description: 'DESTRUCTIVE: move a letter to the trash. Requires confirm:true. Prefer epost_store_letter to archive something — deleting is not how you tidy an inbox.', inputSchema: { type: 'object', properties: { letter_id: { type: 'string' }, confirm: { type: 'boolean' } }, required: ['letter_id', 'confirm'] } },
+  { name: 'epost_download_thumbnail', description: 'Save the thumbnail image of a letter — useful to eyeball a document without fetching the whole PDF.', inputSchema: { type: 'object', properties: { letter_id: { type: 'string' }, output_path: { type: 'string' } }, required: ['letter_id', 'output_path'] } },
   { name: 'epost_list_storage', description: 'List the user\'s custom folders (name + document count) in the ePost Storage area plus the unsorted My-Documents count.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_storage_documents', description: 'List the documents in Storage. Over the API each carries a real description ("Invoice from ...") and documentTypes; over the browser fallback only a date and the folder tag. Pass folder_id to list one folder, scroll_all for the browser path.', inputSchema: { type: 'object', properties: { folder_id: { type: 'string', description: 'limit to one folder (API only)' }, limit: { type: 'number' }, scroll_all: { type: 'boolean', description: 'browser fallback: load every card first' } } } },
   { name: 'epost_read_storage_document', description: 'Open one Storage document and report what the portal knows about it: the real sender/subject line, document type, date, amount and current folder. The card list only ever shows "Gescannter Brief", so this is the only way to classify an archived document. Pass output_dir to also save the PDF.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string' }, folder_id: { type: 'string' }, output_dir: { type: 'string', description: 'save the PDF here as well' } } } },
@@ -1332,6 +1368,54 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       await saveState();
       if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
+    }
+    if (name === 'epost_search') {
+      const res = await apiSearch(args.keyword, args.location || 'ALL', args.limit || 50);
+      if (!res) return text({ error: 'search needs the API', hint: apiUnavailable || 'configure an API password or key' });
+      const items = Array.isArray(res) ? res : (res.letters || res.content || []);
+      return text({ transport: 'api', count: items.length, letters: items.map(apiLetterRow) });
+    }
+    if (name === 'epost_get_letter') {
+      const l = await apiGetLetter(args.letter_id);
+      if (!l) return text({ error: 'not found, or the API is unavailable', hint: apiUnavailable });
+      return text({ transport: 'api', ...apiLetterRow(l, 0), raw: l });
+    }
+    if (name === 'epost_unread_count') {
+      const c = await apiUnreadCount();
+      if (c === null) return text({ error: 'needs the API', hint: apiUnavailable });
+      return text({ transport: 'api', unread: typeof c === 'object' ? (c.count ?? c.unreadCount ?? c) : c });
+    }
+    if (name === 'epost_set_read_status') {
+      const ok = await apiSetRead(args.letter_ids, args.status);
+      return text(ok ? { transport: 'api', updated: args.letter_ids.length, status: args.status }
+        : { error: 'needs the API', hint: apiUnavailable });
+    }
+    if (name === 'epost_list_deleted') {
+      const res = await apiDeletedLetters();
+      if (!res) return text({ error: 'needs the API', hint: apiUnavailable });
+      const items = Array.isArray(res) ? res : (res.letters || res.content || []);
+      return text({ transport: 'api', count: items.length, letters: items });
+    }
+    if (name === 'epost_restore_letter') {
+      const ok = await apiRestoreLetter(args.letter_id);
+      return text(ok ? { transport: 'api', restored: args.letter_id } : { error: 'needs the API', hint: apiUnavailable });
+    }
+    if (name === 'epost_delete_letter') {
+      // Deleting is the one irreversible-ish action here, and it is never the
+      // right way to tidy an inbox — archiving is. Hence the explicit gate.
+      if (args.confirm !== true) {
+        return text({ refused: 'confirm:true is required', note: 'to file a letter away use epost_store_letter; delete only when you mean to discard it' });
+      }
+      const ok = await apiDeleteLetter(args.letter_id);
+      return text(ok ? { transport: 'api', deleted: args.letter_id, note: 'recoverable with epost_restore_letter until it expires from the trash' }
+        : { error: 'needs the API', hint: apiUnavailable });
+    }
+    if (name === 'epost_download_thumbnail') {
+      const bytes = await apiThumbnail(args.letter_id);
+      if (!bytes) return text({ error: 'needs the API', hint: apiUnavailable });
+      mkdirSync(dirname(args.output_path), { recursive: true });
+      writeFileSync(args.output_path, bytes);
+      return text({ transport: 'api', saved: args.output_path, bytes: bytes.length });
     }
     if (name === 'epost_list_storage') {
       const dirs = await apiListDirectories();

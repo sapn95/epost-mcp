@@ -1,26 +1,25 @@
 # epost-mcp
 
-[![npm](https://img.shields.io/npm/v/epost-mcp?logo=npm)](https://www.npmjs.com/package/epost-mcp)
-[![CI](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/epost-mcp?logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/epost-mcp) [![CI](https://img.shields.io/github/actions/workflow/status/sapn95/epost-mcp/ci.yml?branch=main&logo=github&label=CI)](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml) [![node](https://img.shields.io/node/v/epost-mcp?logo=node.js&logoColor=white&color=5FA04E)](https://nodejs.org) [![licence](https://img.shields.io/npm/l/epost-mcp?color=blue)](LICENSE)
 
-> **Unofficial, and inherently fragile.** This drives a web portal with a real
-> browser because the service offers no retrieval API. Portal updates break
-> selectors without warning, and a broken selector means a failed run rather
-> than a wrong result. It is published because it is useful, not because it is
-> guaranteed — pin a version, read the errors, and expect to update. Use it for
-> **your own** account and respect the provider's terms of service.
+**Read, download and archive your Swiss ePost digital letterbox — over the documented public API, with browser automation as a fallback.**
+
+> **Unofficial.** Not affiliated with ePost or Swiss Post. It speaks their
+> documented public API where it can and falls back to driving the web portal
+> where it cannot — that fallback is inherently fragile, since portal updates
+> break selectors without warning. Use it for **your own** letterbox and respect
+> the provider's terms of service.
 
 An [MCP](https://modelcontextprotocol.io) server for the Swiss **ePost** digital
 letterbox ([app.epost.ch](https://app.epost.ch)). It lets an MCP client (Claude
 Code, Claude Desktop, …) **list and download your scanned letters** and do basic
 housekeeping in the ePost **Storage** area — folders and moving documents.
 
-ePost has **no public retrieval API** for private customers (the
-[public APIs](https://developer.epost.ch/) cover *sending* only). This server
-therefore drives the web portal with Playwright browser automation. That makes it
-inherently fragile: portal updates can break selectors, and it depends on your
-interactive SwissID login. Use it for **your own** letterbox and respect ePost's
-terms of service.
+ePost does publish a [public API](https://developer.epost.ch/) for the Digital
+Letterbox, and a private tenant can use it — see *Transport* below. That is the
+preferred path: no browser, no session, and letters arrive with a real sender
+description. Browser automation via Playwright remains for the few things the
+API does not cover.
 
 ## Prerequisites
 
@@ -244,6 +243,14 @@ Or add it directly to `~/.claude.json`:
 | `epost_download_letter` | `index` (number), `output_dir` (string) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |
 | `epost_store_letter` | `folder` (required); `index` or `title` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` |
+| `epost_search` | `keyword`; `location` (`ALL`\|`INBOX`\|`STORAGE`), `limit` | **Full-text search inside the letters.** API only — the portal offers nothing like it. |
+| `epost_get_letter` | `letter_id` | One letter: sender description, document types, dates, read status |
+| `epost_unread_count` | — | `{ unread }` |
+| `epost_set_read_status` | `letter_ids[]`, `status` (`READ`\|`UNREAD`) | Mark letters read or unread |
+| `epost_list_deleted` | — | Trash, with days remaining before permanent removal |
+| `epost_restore_letter` | `letter_id` | Restore a deleted letter to the inbox |
+| `epost_delete_letter` | `letter_id`, `confirm: true` | ⚠️ Moves a letter to the trash. Gated behind `confirm`; to file something away use `epost_store_letter` instead |
+| `epost_download_thumbnail` | `letter_id`, `output_path` | Thumbnail image — eyeball a document without fetching the PDF |
 | `epost_list_storage` | — | `{ folders: [{ name, count }], myDocuments, url }` — your **Custom** folders + the My-Documents count |
 | `epost_list_storage_documents` | `scroll_all` (bool, optional) | `{ count, documents: [{ index, date, storedIn, preview }] }` — pass `scroll_all:true` to lazy-load every card |
 | `epost_read_storage_document` | `index` or `title`; `output_dir` (optional) | Opens one Storage document: real sender/subject, document type, date, amount, folder — and saves the PDF when `output_dir` is given. The only way to classify an archived document, since the card list only ever says "Gescannter Brief". |
