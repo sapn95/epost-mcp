@@ -13,6 +13,8 @@
 //   EPOST_SWISSID_USER  account e-mail (or keychain epost-mcp-swissid-user)
 //   EPOST_TRANSPORT auto (default) | api | browser
 //   EPOST_API_PASSWORD  API password (or keychain epost-mcp-api-password)
+//   EPOST_API_KEY       X-API-KEY (or keychain epost-mcp-api-key) — alternative
+//                       to the password grant, or sent alongside it
 //   EPOST_DEBUG     1 = trace the login steps on stderr
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -404,6 +406,11 @@ async function syncSignCount(armed) {
 //                                                                  -> access_token (600s)
 
 const API_BASE = process.env.EPOST_API_BASE || 'https://api.epost.ch';
+// The API documents TWO security schemes: an API key (X-API-KEY) and Bearer.
+// Support both. A key alone is enough for the letterbox endpoints and skips the
+// password grant entirely; when both are configured the key is sent alongside
+// the token, which is what the portal's own examples do.
+const KC_API_KEY = 'epost-mcp-api-key';
 // auto (default) = API when it can serve the call, browser otherwise.
 // Forcing one is for diagnosis and for the operations only the browser can do.
 const TRANSPORT = (process.env.EPOST_TRANSPORT || 'auto').toLowerCase();
@@ -411,6 +418,11 @@ const KC_API_PASSWORD = 'epost-mcp-api-password';
 
 let apiToken = null;          // { value, expiresAt, tenant }
 let apiUnavailable = null;    // why the API cannot be used, once known
+
+function apiKey() {
+  if (TRANSPORT === 'browser') return '';
+  return process.env.EPOST_API_KEY || keychainRead(KC_API_KEY) || '';
+}
 
 function apiCredentials() {
   if (TRANSPORT === 'browser') return null;      // pinned to the browser
@@ -426,6 +438,8 @@ async function apiFetch(method, path, { params, form, token, raw } = {}) {
   }
   const headers = { Accept: 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
+  const key = apiKey();
+  if (key) headers['X-API-KEY'] = key;
   let body;
   if (form) {
     headers['Content-Type'] = 'application/x-www-form-urlencoded';
@@ -450,7 +464,9 @@ async function apiAuth() {
   if (apiToken && Date.now() < apiToken.expiresAt) return apiToken.value;
   const creds = apiCredentials();
   if (!creds) {
-    apiUnavailable = 'no API password configured (keychain item epost-mcp-api-password)';
+    // An API key on its own is a complete credential — no password grant needed.
+    if (apiKey()) { apiUnavailable = null; return 'api-key'; }
+    apiUnavailable = 'no API credentials configured (keychain: epost-mcp-api-password or epost-mcp-api-key)';
     return null;
   }
   try {
@@ -482,8 +498,9 @@ async function apiAuth() {
 // Run `fn` against the API; return null if the API cannot serve it, so the
 // caller falls back to the browser instead of failing.
 async function withApi(fn) {
-  const token = await apiAuth();
-  if (!token) return null;
+  const auth = await apiAuth();
+  if (!auth) return null;
+  const token = auth === 'api-key' ? null : auth;   // key travels in the header
   try {
     return await fn(token);
   } catch (e) {
@@ -1228,7 +1245,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             : 'NOT available — the bundled Chromium cannot reach the platform authenticator; set EPOST_BROWSER=chrome';
       return text({
         transport: TRANSPORT === 'auto' ? (apiCredentials() ? 'auto (API preferred)' : 'auto (browser — no API password set)') : TRANSPORT,
-        api: apiUnavailable ? `unavailable: ${apiUnavailable}` : (apiCredentials() ? 'configured' : 'no password configured'),
+        api: apiUnavailable ? `unavailable: ${apiUnavailable}`
+          : [apiCredentials() && 'password grant', apiKey() && 'X-API-KEY'].filter(Boolean).join(' + ') || 'no credentials configured',
         browser: { key: browserChoice.key, path: browserChoice.path, chosen_because: browserChoice.reason },
         touch_id_passkeys: touchId,
         swissid_user: user ? user.replace(/^(.).*(@.*)$/, '$1***$2') : 'not set — epost_login cannot skip the e-mail step',
@@ -1240,6 +1258,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           EPOST_PROFILE: 'persistent browser profile',
           EPOST_TRANSPORT: 'auto (default) | api | browser',
           EPOST_API_PASSWORD: 'API password (or keychain item "epost-mcp-api-password")',
+          EPOST_API_KEY: 'X-API-KEY (or keychain item "epost-mcp-api-key")',
           EPOST_DEBUG: '1 to trace the login steps on stderr',
         },
       });

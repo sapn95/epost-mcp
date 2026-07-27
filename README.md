@@ -111,7 +111,11 @@ After a browser move, the API reports exactly which document id ended up in
 which folder — which matters because Storage cards show only a date, and dates
 repeat.
 
-### Auth model
+### Auth: two schemes, both supported
+
+The API documents an **API key** and **Bearer** auth, and this server does both.
+
+**Password grant** (what the private-tenant guide describes):
 
 ```
 POST /core/latest/tenants   {username, password}                     -> tenant_id, company_id
@@ -120,8 +124,28 @@ POST /core/latest/token     {username, password, grant_type=password,
 GET  /epost/v2/letters      Authorization: Bearer …
 ```
 
-The server re-authenticates a minute before expiry rather than tracking refresh
-tokens: the password is already at hand, so a refresh buys nothing.
+It re-authenticates a minute before expiry rather than tracking refresh tokens:
+the password is already at hand, so a refresh buys nothing.
+
+**API key**, as an alternative or in addition:
+
+```bash
+security add-generic-password -a epost -s epost-mcp-api-key -w '<key>' -U
+# or: export EPOST_API_KEY=<key>
+```
+
+Sent as `X-API-KEY`. A key on its own is a complete credential — the password
+grant is then skipped entirely, which is the simpler setup if you have one. When
+both are configured the key travels alongside the token, matching the portal's
+own examples.
+
+`epost_settings` reports which of the two are in play.
+
+### Choosing the transport
+
+`EPOST_TRANSPORT` is `auto` by default: the API answers whatever it can, the
+browser takes the rest. Pin it to `api` or `browser` to diagnose a result, or to
+force the browser for the one thing only it can do.
 
 ## Login: one fingerprint, nothing else
 
