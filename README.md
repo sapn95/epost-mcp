@@ -1,8 +1,20 @@
+<div align="center">
+
 # epost-mcp
 
-[![npm](https://img.shields.io/npm/v/epost-mcp?logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/epost-mcp) [![CI](https://img.shields.io/github/actions/workflow/status/sapn95/epost-mcp/ci.yml?branch=main&logo=github&label=CI)](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml) [![node](https://img.shields.io/node/v/epost-mcp?logo=node.js&logoColor=white&color=5FA04E)](https://nodejs.org) [![licence](https://img.shields.io/npm/l/epost-mcp?color=blue)](LICENSE)
+Read, download and archive your Swiss **ePost** digital letterbox — over the documented public API, with browser automation as a fallback.
 
-**Read, download and archive your Swiss ePost digital letterbox — over the documented public API, with browser automation as a fallback.**
+[![npm](https://img.shields.io/npm/v/epost-mcp?style=flat-square&logo=npm&logoColor=white&label=npm&color=CB3837)](https://www.npmjs.com/package/epost-mcp)
+&nbsp;
+[![CI](https://img.shields.io/github/actions/workflow/status/sapn95/epost-mcp/ci.yml?branch=main&style=flat-square&logo=github&logoColor=white&label=CI)](https://github.com/sapn95/epost-mcp/actions/workflows/ci.yml)
+&nbsp;
+[![node](https://img.shields.io/node/v/epost-mcp?style=flat-square&logo=nodedotjs&logoColor=white&color=5FA04E)](https://nodejs.org)
+&nbsp;
+[![licence](https://img.shields.io/npm/l/epost-mcp?style=flat-square&color=4C5B5C)](LICENSE)
+
+</div>
+
+---
 
 > **Unofficial.** Not affiliated with ePost or Swiss Post. It speaks their
 > documented public API where it can and falls back to driving the web portal
