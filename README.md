@@ -117,9 +117,11 @@ folders. `PATCH /letters/{id}/archive` is inbox → folder only and answers `400
 for anything already archived — the documentation says so explicitly. Re-filing
 therefore falls back to the browser.
 
-A useful division follows from that: **the browser acts, the API verifies.**
-After a browser move, the API reports exactly which document id ended up in
-which folder — which matters because Storage cards show only a date, and dates
+A useful division follows from that: **the browser acts, the API checks.** The
+move itself is not verified for you — `epost_move_to_folder` reports what the
+portal accepted, not what it ended up holding. Run
+`epost_list_storage_documents` afterwards and the API says which document id is
+in which folder, which matters because Storage cards show only a date, and dates
 repeat.
 
 ### Auth: two schemes, both supported
