@@ -2,7 +2,7 @@ import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 import { start } from './mock-epost.mjs';
 import { startServer } from './client.mjs';
 
@@ -63,7 +63,7 @@ describe('authentication', () => {
 describe('reading', () => {
   test('lists inbox letters with the real description, not the uniform title', async () => {
     const { data } = await srv.call('epost_list_letters');
-    assert.equal(data.count, 2);
+    assert.equal(data.count, 3);
     assert.equal(data.letters[0].sender, 'Invoice from Someone AG');
     assert.deepEqual(data.letters[0].documentTypes, ['Invoice']);
     assert.equal(data.letters[0].date, '02.02.2020', 'date is rendered dd.mm.yyyy like the portal');
@@ -92,7 +92,7 @@ describe('reading', () => {
 
   test('counts unread', async () => {
     const { data } = await srv.call('epost_unread_count');
-    assert.equal(data.unread, 1);
+    assert.equal(data.unread, 2, 'inbox-2 is the only one marked read');
   });
 
   test('searches inside letter content', async () => {
@@ -111,6 +111,18 @@ describe('downloads', () => {
     const { data } = await srv.call('epost_download_letter', { index: 0, output_dir: out });
     assert.ok(existsSync(data.saved), 'file written');
     assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'looks like a PDF');
+  });
+
+  test('a path-shaped value from the service cannot steer the file out of output_dir', async () => {
+    // The name is assembled from the letter id and the date the service
+    // reported. join() resolves "../" without complaint, so either of those
+    // could have written anywhere the process can reach.
+    const dir = mkdtempSync(join(tmpdir(), 'epost-escape-'));
+    const { data } = await srv.call('epost_download_letter', { letter_id: 'inbox-3', output_dir: dir });
+    assert.ok(data.saved, `nothing saved: ${JSON.stringify(data)}`);
+    const rel = relative(dir, data.saved);
+    assert.ok(rel && !rel.startsWith('..') && !isAbsolute(rel), `escaped to ${data.saved}`);
+    assert.ok(existsSync(data.saved));
   });
 
   test('saves a thumbnail', async () => {

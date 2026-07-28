@@ -67,12 +67,24 @@ try {
     }
   }
 
-  // Every tool the dispatcher answers must be advertised, and vice versa: an
-  // unadvertised tool is unreachable, an advertised-but-unhandled one returns
-  // "unknown tool" to a client that trusted the list.
-  const src = readFileSync(entry, 'utf8');
+  // Every advertised tool must actually be dispatched. This used to grep the
+  // source for the names the same source had just advertised, which is a
+  // tautology: it was green the whole time the README documented three tools
+  // that had been deleted. Ask the server instead — an unhandled name is the
+  // one thing the dispatcher answers with "unknown tool", and every other
+  // outcome, error included, proves a branch exists.
   for (const n of names) {
-    check(src.includes(`'${n}'`) || src.includes(`"${n}"`), `${n}: handled in the server source`);
+    const r = await send("tools/call", { name: n, arguments: {} }).catch(e => ({ error: e }));
+    const said = JSON.stringify(r?.result ?? r?.error ?? r);
+    check(!/unknown tool/i.test(said), `${n}: reaches a dispatcher branch`);
+  }
+
+  // And nothing may be dispatched that is not advertised: a tool only the
+  // author knows about is a tool nobody can discover.
+  const src = readFileSync(entry, 'utf8');
+  const dispatched = [...src.matchAll(/name === '([a-z][a-z0-9_]*)'/g)].map(m => m[1]);
+  for (const n of new Set(dispatched)) {
+    check(names.includes(n), `${n}: dispatched and advertised`);
   }
 
   check(!/Error|Cannot find|ERR_/i.test(stderr), `clean stderr${stderr ? ` (got: ${stderr.slice(0, 120)})` : ''}`);
