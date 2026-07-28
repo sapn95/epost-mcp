@@ -145,6 +145,16 @@ describe('downloads', () => {
     assert.equal(statSync(p).mode & 0o777, 0o600);
   });
 
+  test('a file descriptor is not an output path', async () => {
+    // writeFileSync takes a number as an fd: output_path 2 wrote the letter to
+    // stderr and 1 wrote it into the MCP stream itself.
+    for (const bad of [2, 1, '']) {
+      const { raw, isError } = await srv.call('epost_download_thumbnail', { letter_id: 'inbox-1', output_path: bad });
+      assert.ok(isError, `output_path ${JSON.stringify(bad)} was accepted`);
+      assert.match(raw, /must be a path/);
+    }
+  });
+
   test('reads an archived document and can save it', async () => {
     const { data } = await srv.call('epost_read_storage_document', { index: 0, output_dir: out });
     assert.equal(data.transport, 'api');
