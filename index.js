@@ -958,11 +958,20 @@ async function assistedLogin(p, waitMs = 300000) {
   const deadline = Date.now() + waitMs;
   const done = new Set();
   let lastSeen = '';
+  // Marked done only once it worked. Marking first meant a control that had
+  // not finished rendering was tried exactly once, failed, and never tried
+  // again — a login that would have succeeded a second later instead sat there
+  // until the window ran out.
   const once = async (step, action) => {
     if (done.has(step)) return false;
-    done.add(step);
     if (DEBUG) console.error('[login]', step);
-    await action();
+    try {
+      await action();
+    } catch (e) {
+      if (DEBUG) console.error('[login]', step, 'not yet:', (e.message || '').split('\n')[0].slice(0, 80));
+      return false;
+    }
+    done.add(step);
     return true;
   };
 
@@ -1213,7 +1222,7 @@ async function clickVisibleByText(p, t) {
 
 const TOOLS = [
   { name: 'epost_status', description: 'Check whether the ePost session is alive (ok) or an interactive SwissID login is needed (login_required).', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_login', description: 'Open a VISIBLE browser window and drive the whole SwissID login except the biometric prompt: it goes to SwissID, fills the account e-mail and requests the passkey, so you only confirm with Touch ID. Falls back to a normal manual login. Caches the session afterwards.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 300)' } } } },
+  { name: 'epost_login', description: 'Open a VISIBLE browser window and drive the whole SwissID login except the biometric prompt: it goes to SwissID, fills the account e-mail and requests the passkey, so you only confirm with Touch ID. Falls back to a normal manual login. Caches the session afterwards.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', minimum: 30, description: 'how long to keep the window open (default 300, minimum 30 — a SwissID redirect chain takes longer than that on its own)' } } } },
   { name: 'epost_settings', description: 'Show the resolved configuration: which browser is driven and why, whether it can use Touch ID passkeys, the profile/state paths, and whether the SwissID account e-mail is configured.', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, id, sender, title, date, read). Over the API at most `limit` are returned and the reply says so when that window was filled.', inputSchema: { type: 'object', properties: { limit: { type: 'number', minimum: 1, description: 'how many to fetch over the API (default 200)' } } } },
   { name: 'epost_download_letter', description: 'Download one letter to output_dir, addressed by list index or by letter_id. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf), written 0600.', inputSchema: { type: 'object', properties: { index: { type: 'number', minimum: 0 }, letter_id: { type: 'string', description: 'instead of index; needs the public API' }, output_dir: { type: 'string' } }, required: ['output_dir'] } },
@@ -1280,6 +1289,9 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_login') {
       const p = await getPage(true);
+      // Clamped, and the schema says so now: a five-second window cannot
+      // outlast the redirect chain, so honouring it would only ever report a
+      // timeout that the caller caused.
       const status = await assistedLogin(p, Math.max(30, Number(args.wait_seconds) || 300) * 1000);
       await saveState();
       const passkeyCapable = browserChoice.key && browserChoice.key !== 'chromium';
@@ -1451,7 +1463,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       const res = await apiSearch(args.keyword, args.location || 'ALL', args.limit || 50);
       if (!res) return text({ error: 'search needs the API', hint: apiUnavailable || 'configure an API password or key' });
       const items = Array.isArray(res) ? res : (res.letters || res.content || []);
-      return text({ transport: 'api', count: items.length, letters: items.map(apiLetterRow) });
+      // A full page of matches is not "these are all the matches", and the
+      // difference decides whether a caller concludes a letter does not exist.
+      const searchLimit = args.limit || 50;
+      return text({
+        transport: 'api', count: items.length, letters: items.map(apiLetterRow),
+        ...(items.length >= searchLimit ? { truncated: true, hint: `exactly ${searchLimit} matched, so there may be more — raise limit` } : {}),
+      });
     }
     if (name === 'epost_get_letter') {
       const l = await apiGetLetter(args.letter_id);
