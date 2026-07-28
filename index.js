@@ -197,6 +197,26 @@ function writePrivate(path, bytes) {
   try { writeSync(fd, bytes); fchmodSync(fd, 0o600); } finally { closeSync(fd); }
 }
 
+const oneByTitle = (items, title) => {
+  const hits = items.filter(x => JSON.stringify(x).includes(title));
+  if (hits.length > 1) throw new Error(`"${title}" matches ${hits.length} letters — address one by id or index instead`);
+  return hits[0] || null;
+};
+
+// Resolve a document addressed by a text substring, and refuse to guess.
+//
+// Storage cards show only a date, and dates repeat; "the first card containing
+// this text" therefore moved, read or archived a neighbour just as readily as
+// the intended document. A substring that matches more than one thing is not
+// an address.
+async function cardByTitle(p, title) {
+  const all = p.locator('div.letter-wrapper', { hasText: title });
+  const n = await all.count();
+  if (!n) throw new Error(`no document matching "${title}"`);
+  if (n > 1) throw new Error(`"${title}" matches ${n} documents — address one by index instead`);
+  return all.first();
+}
+
 // A file name is assembled from values the service supplies — a letter id, a
 // date it reported. join() resolves "../" happily, so an id shaped like a path
 // would write outside the directory the caller named. Keep name parts to
@@ -773,8 +793,7 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
     checkIndex(index, await cards.count(), 'loaded documents');
     card = cards.nth(index);
   } else if (title) {
-    card = p.locator('div.letter-wrapper', { hasText: title }).first();
-    if (!(await card.count())) throw new Error(`no document matching "${title}"`);
+    card = await cardByTitle(p, title);
   } else {
     throw new Error('pass either index or title');
   }
@@ -1006,8 +1025,7 @@ async function storeLetter(p, { index, title, folder }) {
     checkIndex(index, await cards.count(), 'letters');
     card = cards.nth(index);
   } else if (title) {
-    card = p.locator('div.letter-wrapper', { hasText: title }).first();
-    if (!(await card.count())) throw new Error(`no letter matching "${title}"`);
+    card = await cardByTitle(p, title);
   } else throw new Error('pass either index or title');
 
   const label = (await card.innerText().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 80);
@@ -1093,8 +1111,7 @@ async function readStorageDocument(p, { index, title, outputDir }) {
     checkIndex(index, await cards.count(), 'documents');
     card = cards.nth(index);
   } else if (title) {
-    card = p.locator('div.letter-wrapper', { hasText: title }).first();
-    if (!(await card.count())) throw new Error(`no document matching "${title}"`);
+    card = await cardByTitle(p, title);
   } else throw new Error('pass either index or title');
 
   await card.scrollIntoViewIfNeeded().catch(() => {});
@@ -1335,7 +1352,16 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       }
     }
     if (name === 'epost_download_letter') {
+      // letter_id is an API concept. The browser path addresses by position, so
+      // falling through with an id set silently answered a different question —
+      // and with index also supplied it answered it using that instead.
+      if (args.letter_id && typeof args.index === 'number') {
+        return text({ error: 'pass either letter_id or index, not both — they address different things' });
+      }
       const apiLetters = await apiListLetters(200);
+      if (!apiLetters && args.letter_id) {
+        return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'address the letter by index to use the portal instead' });
+      }
       if (apiLetters) {
         const l = args.letter_id ? apiLetters.find(x => x.id === args.letter_id) : apiLetters[args.index];
         if (l) {
@@ -1379,10 +1405,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           return text({ error: `folder "${args.folder}" not found`, available: dirs.filter(d => d.directoryId).map(d => d.directoryName) });
         }
         const letters = await apiListLetters(200);
+        if (!letters && args.letter_id) {
+          return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'address the letter by index or title to use the portal instead' });
+        }
         if (letters) {
           const l = args.letter_id ? letters.find(x => x.id === args.letter_id)
             : typeof args.index === 'number' ? letters[args.index]
-              : args.title ? letters.find(x => JSON.stringify(x).includes(args.title)) : null;
+              : args.title ? oneByTitle(letters, args.title) : null;
           if (!l && args.letter_id) {
             // Falling through to the browser here would complain about a
             // missing index, which sends the reader looking in the wrong place.
@@ -1480,6 +1509,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       return text(out);
     }
     if (name === 'epost_list_storage_documents') {
+      // folder_id is an API concept; the portal lists everything. Falling
+      // through with one set answered "all of Storage" to a question about one
+      // folder, and the caller could not tell.
+      if (args.folder_id) {
+        const scoped = await apiArchiveWithFolders(1000);
+        if (!scoped) return text({ error: 'folder_id needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'drop folder_id to list the whole of Storage through the portal' });
+      }
       const viaApi = args.folder_id
         ? await apiListArchive(args.folder_id, args.limit || 1000)
         : await apiArchiveWithFolders(args.limit || 1000);
@@ -1509,7 +1545,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         const items = Array.isArray(arch) ? arch : (arch.letters || arch.content || []);
         const l = args.letter_id ? items.find(x => x.id === args.letter_id)
           : typeof args.index === 'number' ? items[args.index]
-            : args.title ? items.find(x => JSON.stringify(x).includes(args.title)) : null;
+            : args.title ? oneByTitle(items, args.title) : null;
         // The API answered and there is no such document. Asking the browser the
         // same question with a different meaning of "index" is not a fallback.
         if (!l && apiOnly) {

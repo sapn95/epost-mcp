@@ -91,7 +91,8 @@ export function start() {
     const m = /^\/epost\/v2\/letters\/([^/]+)(\/.*)?$/.exec(p);
     if (m) {
       const [, id, tail] = m;
-      const known = [...state.inbox, ...state.archive].find(l => l.id === id);
+      // Deleted letters are addressable too — restoring one is the whole point.
+      const known = [...state.inbox, ...state.archive, ...state.deleted].find(l => l.id === id);
       if (!known) return send(404, { error: 'not_found' });
       if (tail === '/content') return send(200, Buffer.from('%PDF-1.4 mock'), 'application/octet-stream');
       // The real eight PNG magic bytes. Written as a string, "\x89" goes out as
@@ -100,7 +101,14 @@ export function start() {
       if (tail === '/thumbnail') {
         return send(200, Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(' mock')]), 'image/png');
       }
-      if (tail === '/restore' && req.method === 'POST') return send(204, '');
+      // A real restore moves the letter. Answering 204 and changing nothing let
+      // an implementation that restores no letter at all pass its test.
+      if (tail === '/restore' && req.method === 'POST') {
+        if (!state.deleted.some(l => l.id === id)) return send(400, { error: 'not_deleted' });
+        state.deleted = state.deleted.filter(l => l.id !== id);
+        state.inbox.push(known);
+        return send(204, '');
+      }
       if (tail === '/archive' && req.method === 'PATCH') {
         if (state.archive.some(l => l.id === id)) {
           return send(400, { error: 'bad_request', error_description: 'Letter is already archived!' });
@@ -112,7 +120,12 @@ export function start() {
         return send(204, '');
       }
       if (!tail && req.method === 'GET') return send(200, known);
-      if (!tail && req.method === 'DELETE') return send(204, '');
+      if (!tail && req.method === 'DELETE') {
+        state.inbox = state.inbox.filter(l => l.id !== id);
+        state.archive = state.archive.filter(l => l.id !== id);
+        if (!state.deleted.some(l => l.id === id)) state.deleted.push(known);
+        return send(204, '');
+      }
     }
     return send(404, { error: 'no_route', path: p });
   });

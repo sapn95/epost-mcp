@@ -52,7 +52,15 @@ const denylist = existsSync(DENYLIST_PATH)
 let bad = 0;
 for (const f of files) {
   let body;
-  try { body = readFileSync(f, 'utf8'); } catch { continue; }
+  // What gets committed is the INDEX, not the working tree. Reading the file
+  // from disk meant a secret could be staged and then removed from the working
+  // copy, and this gate would wave it through into the commit. Prefer the
+  // staged blob; fall back to disk for files that are tracked but unstaged.
+  try {
+    body = execFileSync('git', ['show', `:${f}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  } catch {
+    try { body = readFileSync(f, 'utf8'); } catch { continue; }
+  }
   // A source file writes a multi-line postal address as one string with \n in
   // it — two literal characters, not a break. The word-boundary anchors then
   // see `n` running into the capital and match nothing, so an address inside a

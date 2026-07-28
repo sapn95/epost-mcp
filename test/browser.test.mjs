@@ -177,6 +177,15 @@ describe('portal automation', () => {
       `the letters call got somebody else's page: ${JSON.stringify(letters.data).slice(0, 140)}`);
   });
 
+  test('a title that matches two documents is refused, not guessed at', SLOW, async () => {
+    // Storage cards show only a date, and the fixture has two on 04.04.2020 —
+    // exactly the case the portal produces constantly. Taking the first match
+    // moved, read or archived a neighbour just as readily as the right one.
+    const { raw } = await srv.call('epost_read_storage_document', { title: '04.04.2020' });
+    assert.match(raw, /matches 2 documents/, `it picked one: ${raw.slice(0, 140)}`);
+    assert.match(raw, /by index/, 'and says how to address it properly');
+  });
+
   test('an unknown tool name is reported, not ignored', SLOW, async () => {
     const { raw } = await srv.call('epost_does_not_exist', {});
     assert.match(raw, /unknown tool/i);

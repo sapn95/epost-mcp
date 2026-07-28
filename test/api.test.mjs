@@ -190,9 +190,15 @@ describe('archiving', () => {
     assert.equal(data.updated, 1);
   });
 
-  test('restores a deleted letter', async () => {
-    const { data } = await srv.call('epost_restore_letter', { letter_id: 'inbox-1' });
-    assert.equal(data.restored, 'inbox-1');
+  test('restores a deleted letter, and the trash gives it up', async () => {
+    // It used to restore inbox-1 — a letter that was never in the trash —
+    // against a mock that answered 204 and changed nothing. An implementation
+    // that restores nothing at all passed that.
+    assert.ok(mock.state.deleted.some(l => l.id === 'del-1'), 'del-1 starts in the trash');
+    const { data } = await srv.call('epost_restore_letter', { letter_id: 'del-1' });
+    assert.equal(data.restored, 'del-1');
+    assert.ok(!mock.state.deleted.some(l => l.id === 'del-1'), 'it left the trash');
+    assert.ok(mock.state.inbox.some(l => l.id === 'del-1'), 'and arrived in the inbox');
   });
 });
 
