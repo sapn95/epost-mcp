@@ -95,6 +95,15 @@ describe('portal automation', () => {
     assert.ok(portal.state.stored.length > before, 'the sheet was committed');
   });
 
+  test('a login that never authenticates reports login_required, not success', SLOW, async () => {
+    // The fixture has no SwissID chain, so the assisted login can only time out.
+    // What matters is that it says so rather than claiming a session.
+    const { data } = await srv.call('epost_login', { wait_seconds: 5 });
+    assert.equal(data.status, 'login_required',
+      'no authenticated session exists, so login must not claim one');
+    assert.ok(data.hint || data.browser, 'it says what the caller should do next');
+  });
+
   test('reports the session state', SLOW, async () => {
     const { data } = await srv.call('epost_status');
     assert.equal(data.status, 'ok', 'the fixture presents a reachable letterbox');
