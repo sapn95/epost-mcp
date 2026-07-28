@@ -54,6 +54,17 @@ export function start() {
     calls: [],
     echoPassword: 'test-password',   // what the fake gateway above quotes back
     echoToken: TOKEN,
+    // Statuses to answer the next calls with, one entry per call, so a test can
+    // reproduce the awkward moments a happy mock never produces: a token that
+    // expired between two requests, one endpoint failing while its neighbours
+    // work, a re-authentication that no longer takes. An entry without a `path`
+    // applies to the next letterbox call and deliberately NOT to the two auth
+    // endpoints — otherwise a queued failure would be eaten by the refresh the
+    // first one provokes.
+    forceStatus: [],                 // [{ status, path? }]
+    // A gateway that answers a thumbnail request with an error PAGE, 200 and
+    // all. Any 200 used to be saved under the thumbnail's name.
+    thumbnailAsHtml: false,
   };
 
   const srv = createServer((req, res) => {
@@ -66,6 +77,14 @@ export function start() {
     };
     const auth = req.headers.authorization || '';
     const key = req.headers['x-api-key'];
+
+    // Queued failures, consumed one per matching call — see state.forceStatus.
+    const AUTH = ['/core/latest/tenants', '/core/latest/token'];
+    const forced = state.forceStatus.findIndex(f => (f.path ? f.path === p : !AUTH.includes(p)));
+    if (forced >= 0) {
+      const [f] = state.forceStatus.splice(forced, 1);
+      return send(f.status, { error: 'forced', path: p });
+    }
 
     // The grant used to accept anything at all, so a server that sent no
     // username, the wrong grant_type or no tenant still passed every
@@ -138,6 +157,7 @@ export function start() {
       // two UTF-8 bytes and the fixture served something that was not a PNG at
       // all — which a caller checking the signature would rightly reject.
       if (tail === '/thumbnail') {
+        if (state.thumbnailAsHtml) return send(200, '<html><body>gateway error</body></html>', 'text/html');
         return send(200, Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(' mock')]), 'image/png');
       }
       // A real restore moves the letter. Answering 204 and changing nothing let

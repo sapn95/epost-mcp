@@ -691,6 +691,22 @@ async function listStorage(p) {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
     const seen = new Set();
     const folders = [];
+    const companies = [];
+    // Everything under the "Companies" heading is a branded folder the service
+    // maintains: it is not a filing target, and offering it as one hands the
+    // caller a destination the move sheet will never accept. The scan looked at
+    // the whole page and reported them alongside the user's own folders.
+    const headings = [...document.querySelectorAll('h1, h2, h3, h4')];
+    const companyHeading = headings.find(h => /^Companies\b/i.test(clean(h.innerText)));
+    const customHeading = headings.find(h => /^Custom\b/i.test(clean(h.innerText)));
+    const isCompany = el => {
+      if (!companyHeading) return false;
+      const FOLLOWING = 4;   // Node.DOCUMENT_POSITION_FOLLOWING, spelled out: this runs in the page, the linter does not
+      const after = companyHeading.compareDocumentPosition(el) & FOLLOWING;
+      if (!after) return false;
+      if (!customHeading) return true;
+      return !(customHeading.compareDocumentPosition(el) & FOLLOWING);
+    };
     for (const el of document.querySelectorAll('*')) {
       if (el.children.length > 5) continue;
       const t = clean(el.innerText);
@@ -701,13 +717,13 @@ async function listStorage(p) {
       const key = name + '|' + m[2];
       if (seen.has(key)) continue;
       seen.add(key);
-      folders.push({ name, count: Number(m[2]) });
+      (isCompany(el) ? companies : folders).push({ name, count: Number(m[2]) });
     }
     const body = clean(document.body.innerText);
     const my = body.match(/My Documents\s*\((\d+)\)/i);
     // Origin and path only: the portal carries per-session instance ids in the
     // query string, and a tool result goes straight into the model's context.
-    return { url: location.origin + location.pathname, myDocuments: my ? Number(my[1]) : null, folders };
+    return { url: location.origin + location.pathname, myDocuments: my ? Number(my[1]) : null, folders, companyFolders: companies };
   });
   return { status: 'ok', ...data };
 }
@@ -922,7 +938,10 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
         : 'a document cannot be left in no folder at all; use epost_move_to_folder with a destination instead',
     };
   }
-  return { status: 'ok', moved: { index, title, folder } };
+  // `moved` for an unfile said the opposite of what had happened.
+  return add
+    ? { status: 'ok', moved: { index, title, folder } }
+    : { status: 'ok', unfiled: { index, title, removed_from: folder } };
 }
 
 // Where the browser is, with nothing that could be replayed: OIDC steps carry a
@@ -1135,11 +1154,20 @@ async function readStorageDocument(p, { index, title, outputDir }) {
 
   const cards = p.locator('div.letter-wrapper');
   let card;
+  // Where the resolved card actually sits, so a title-addressed download gets a
+  // name of its own: `x` for all of them meant two documents with the same date
+  // overwrote each other.
+  let resolvedIndex = null;
   if (typeof index === 'number') {
     checkIndex(index, await cards.count(), 'documents');
     card = cards.nth(index);
+    resolvedIndex = index;
   } else if (title) {
     card = await cardByTitle(p, title);
+    const all = await cards.all();
+    for (let i = 0; i < all.length; i++) {
+      if (await all[i].evaluate((el, other) => el === other, await card.elementHandle())) { resolvedIndex = i; break; }
+    }
   } else throw new Error('pass either index or title');
 
   await card.scrollIntoViewIfNeeded().catch(() => {});
@@ -1198,7 +1226,10 @@ async function readStorageDocument(p, { index, title, outputDir }) {
         target.click({ timeout: 10000 }),
       ]);
       const stamp = (meta.documentDate || '').split('.').reverse().join('-') || 'undated';
-      saved = join(outputDir, `${namePart(stamp)}_ePostStorage_${namePart(index ?? 'x')}.pdf`);
+      // `x` for every title-addressed download meant two documents with the
+      // same date quietly overwrote each other. The resolved position is what
+      // makes the name unique.
+      saved = join(outputDir, `${namePart(stamp)}_ePostStorage_${namePart(index ?? resolvedIndex ?? 'x')}.pdf`);
       await d.saveAs(saved);
       try { chmodSync(saved, 0o600); } catch { /* the download may live elsewhere */ }
     }
@@ -1426,6 +1457,12 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_store_letter') {
       if (!args.folder) throw new Error('folder is required — the Store sheet will not commit without one');
+      // letter_id wins over index and title silently, so a call that named two
+      // different letters archived one and reported the request as given.
+      const given = ['letter_id', 'index', 'title'].filter(k => args[k] !== undefined);
+      if (given.length > 1) {
+        return text({ error: `pass one of letter_id, index or title — got ${given.join(' and ')}, which may name different letters` });
+      }
       // The API archives in one PATCH; the browser needs the two-step folder
       // sheet. Resolve the folder name to its id, and address the letter by id.
       const dirs = await apiListDirectories();

@@ -119,7 +119,13 @@ ${sheet()}
       res.writeHead(204); return res.end();
     }
     if (u.pathname === '/created') {
-      state.created.push(u.searchParams.get('n'));
+      const n = u.searchParams.get('n');
+      // A name that is already taken is refused, and the portal says so by
+      // leaving the dialog open with its complaint in it — there is no other
+      // signal. A fixture that accepted everything let "clicked Create" pass
+      // for "folder exists", which the next store call then cannot find.
+      if (state.created.includes(n)) { res.writeHead(409); return res.end(); }
+      state.created.push(n);
       res.writeHead(204); return res.end();
     }
     if (u.pathname === '/detail') {
@@ -133,7 +139,8 @@ ${sheet()}
          <div id="newfolder" style="display:none">
            <input type="text" id="dlg:folder-name">
            <button id="dlg:create-btn"
-             onclick="fetch('/created?n=' + encodeURIComponent(document.getElementById('dlg:folder-name').value)).then(() => { document.getElementById('newfolder').style.display='none'; })">Create</button>
+             onclick="fetch('/created?n=' + encodeURIComponent(document.getElementById('dlg:folder-name').value)).then(r => { if (r.ok) { document.getElementById('newfolder').style.display='none'; } else { document.getElementById('newfolder-msg').textContent = 'A folder with this name already exists'; } })">Create</button>
+           <div id="newfolder-msg"></div>
          </div>
          <h3>Companies (1)</h3><div class="tile"><span>ePost Scancenter</span> <span>3 Files</span></div>
          <h3>Custom (2)</h3>

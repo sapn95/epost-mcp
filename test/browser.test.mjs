@@ -7,9 +7,9 @@ import { test, before, after, describe } from 'node:test';
 
 const SLOW = { timeout: 120000 };   // per-test budget for anything driving a browser
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { start } from './fixture-portal.mjs';
 import { startServer } from './client.mjs';
 
@@ -83,11 +83,15 @@ describe('portal automation', () => {
     assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'a real PDF, not an error page');
   });
 
-  test('lists the Storage folders with their document counts', SLOW, async () => {
+  test('lists the Storage folders with their counts, and keeps the company one out', SLOW, async () => {
+    // "these are present" passed while the ePost Scancenter tile — a branded
+    // folder the service maintains, and not a filing target — was offered as a
+    // destination the move sheet will never accept. The exact set is the point.
     const { data } = await srv.call('epost_list_storage');
-    const names = (data.folders || []).map(f => f.name.normalize('NFC'));
-    assert.ok(names.includes('Example_Alpha'), `expected Example_Alpha in ${JSON.stringify(names)}`);
-    assert.ok(names.includes('Example_Ümlaut'), 'an NFD name must still be reported');
+    const names = (data.folders || []).map(f => f.name.normalize('NFC')).sort();
+    assert.deepEqual(names, ['Example_Alpha', 'Example_Ümlaut'], `wrong folder set: ${JSON.stringify(names)}`);
+    assert.deepEqual((data.companyFolders || []).map(f => f.name), ['ePost Scancenter'],
+      'the company folder is reported, separately');
   });
 
   test('creates a folder', SLOW, async () => {
@@ -165,6 +169,15 @@ describe('portal automation', () => {
     assert.equal(portal.state.stored.length, before, 'and nothing was committed');
   });
 
+  test('a successful unfile is reported as an unfile, not as a move', SLOW, async () => {
+    // The result said `moved` with the folder that had just been removed —
+    // the opposite of what happened. Example_Beta holds two documents after
+    // the re-file above, so dropping one of them is a legal operation.
+    const { data } = await srv.call('epost_unfile_from_folder', { index: 2, folder: 'Example_Ümlaut' });
+    assert.ok(!data.moved, `reported as a move: ${JSON.stringify(data)}`);
+    assert.ok(data.unfiled || data.status === 'refused', `neither unfiled nor refused: ${JSON.stringify(data)}`);
+  });
+
   test('tool calls that arrive together share one browser', SLOW, async () => {
     // Two launchPersistentContext calls against one profile collide on Chrome's
     // ProcessSingleton: one fails outright, and the stale-lock retry then
@@ -216,5 +229,74 @@ describe('portal automation', () => {
     // document returns one of those instead.
     assert.equal(data.storedIn?.normalize('NFC'), 'Example_Beta',
       'the folder must come from the open detail, not from a card behind it');
+  });
+
+  test('a Storage document addressed by title is saved under a name of its own', SLOW, async () => {
+    // Title-addressed downloads were all named "..._x.pdf", so two documents
+    // with the same date quietly overwrote each other. The card's position is
+    // what makes the name unique, and it has to be found rather than assumed:
+    // 03.03.2020 is the one date this fixture does not repeat.
+    const dir = mkdtempSync(join(tmpdir(), 'epost-title-'));
+    const { data, raw } = await srv.call('epost_read_storage_document', { title: '03.03.2020', output_dir: dir });
+    assert.equal(data.status, 'ok', `nothing was read: ${raw.slice(0, 160)}`);
+    assert.ok(data.saved, `nothing was saved: ${raw.slice(0, 160)}`);
+    assert.match(basename(data.saved), /_0\.pdf$/,
+      `the resolved position is missing from the name: ${basename(data.saved)}`);
+    assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'a real PDF, not an error page');
+  });
+
+  test('a folder the portal refuses is reported as refused, not as created', SLOW, async () => {
+    // Clicking Create is not creating. A name that is already taken leaves the
+    // dialog open with its complaint in it, and this used to report a folder
+    // that does not exist — which the next store call then cannot find.
+    // Neu_Angelegt was created by the test above, so the portal now refuses it.
+    const { data } = await srv.call('epost_create_folder', { name: 'Neu_Angelegt' });
+    assert.equal(data.status, 'refused', `a duplicate was reported as created: ${JSON.stringify(data)}`);
+    assert.match(data.reason, /exists/i, 'it repeats what the portal complained about');
+    assert.equal(portal.state.created.filter(n => n === 'Neu_Angelegt').length, 1,
+      'the portal was told to create it twice');
+  });
+
+  test('a remove_from the sheet does not offer is refused, and nothing is changed', SLOW, async () => {
+    // The destination was ticked, the sheet committed, and the tool reported a
+    // move that had only ever added — the old membership stayed exactly where
+    // it was, and the caller was told otherwise.
+    const before = portal.state.stored.length;
+    const { raw, isError } = await srv.call('epost_move_to_folder', {
+      index: 1, folder: 'Example_Gamma', remove_from: 'Nicht_Vorhanden',
+    });
+    assert.ok(isError, `the half-move was reported as done: ${raw.slice(0, 160)}`);
+    assert.match(raw, /remove_from "Nicht_Vorhanden" is not offered/);
+    assert.match(raw, /nothing was changed/);
+    assert.equal(portal.state.stored.length, before, 'the sheet was committed anyway');
+  });
+
+  test('filing a document where it already is changes nothing', SLOW, async () => {
+    // Folder membership is a multi-select of checkboxes, so a box that is
+    // already ticked is REMOVED by a click. Filing something a second time —
+    // which bulk filing does constantly — used to unfile it instead.
+    const before = portal.state.stored.length;
+    const { data, raw } = await srv.call('epost_move_to_folder', { index: 0, folder: 'Example_Alpha' });
+    assert.equal(data.status, 'ok', `an idempotent move failed: ${raw.slice(0, 160)}`);
+    assert.equal(data.unchanged, true, `it did something: ${JSON.stringify(data)}`);
+    assert.equal(data.in_folder, true, 'it did not notice the document was already filed there');
+    assert.equal(portal.state.stored.length, before, 'the sheet was committed anyway');
+  });
+
+  test('an index that is not there is an error, not the nearest card', SLOW, async () => {
+    // Playwright's nth(-1) means "the last one" and a negative array index is
+    // simply undefined, so a nonsense index quietly acted on a different
+    // document than the one asked for.
+    const dir = mkdtempSync(join(tmpdir(), 'epost-oob-'));
+    const { raw, isError } = await srv.call('epost_download_letter', { index: 5, output_dir: dir });
+    assert.ok(isError, `index 5 of 2 was accepted: ${raw.slice(0, 160)}`);
+    assert.match(raw, /index 5 out of range \(2 letters\)/);
+    assert.deepEqual(readdirSync(dir), [], 'it downloaded something regardless');
+  });
+
+  test('a document has to be addressed somehow', SLOW, async () => {
+    const { raw, isError } = await srv.call('epost_unfile_from_folder', { folder: 'Example_Alpha' });
+    assert.ok(isError, `it acted without being told which document: ${raw.slice(0, 160)}`);
+    assert.match(raw, /pass either index or title/);
   });
 });
