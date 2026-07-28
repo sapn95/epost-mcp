@@ -88,7 +88,8 @@ Set it up once:
 2. In the **same browser**, open `https://login.epost.ch/auth/realms/klara/account/`
    → *Authentication* → *Set/update password*, and set one. A SwissID login has
    no password of its own, which is the whole point of this step.
-3. Store it: `security add-generic-password -a epost -s epost-mcp-api-password -w '<password>' -U`
+3. Store it: `security add-generic-password -a epost -s epost-mcp-api-password -w -U` — `-w` with no
+   value prompts, so the password never reaches your shell history or a process listing.
    (or set `EPOST_API_PASSWORD`). The account e-mail comes from the same place as
    before.
 
@@ -143,7 +144,8 @@ the password is already at hand, so a refresh buys nothing.
 **API key**, as an alternative or in addition:
 
 ```bash
-security add-generic-password -a epost -s epost-mcp-api-key -w '<key>' -U
+# -w with no value prompts, so the key stays out of shell history and argv
+security add-generic-password -a epost -s epost-mcp-api-key -w -U
 # or: export EPOST_API_KEY=<key>
 ```
 
