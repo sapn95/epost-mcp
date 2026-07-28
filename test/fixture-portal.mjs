@@ -103,7 +103,10 @@ ${sheet()}
        a pattern that excluded that letter, so every such name came back null. -->
   <div>Gescannter Brief Invoice from Caramba Example AG CHF 42.00</div>
   <div>Document type Invoice</div><div>Document date 02.02.2020</div>
-  <div class="storage-location-info"><span>Stored in </span> <b>Example_Alpha</b></div>
+  <!-- Deliberately NOT the folder of the first card: a lookup that takes the
+       first .storage-location-info in the document reports that one instead,
+       and a fixture where both say the same thing cannot tell the difference. -->
+  <div class="storage-location-info"><span>Stored in </span> <b>Example_Beta</b></div>
   <a id="dl" download="letter.pdf" href="data:application/pdf;base64,JVBERi0xLjQgbW9jaw==">Download File</a>
   <button onclick="document.getElementById('dl').click()">Download File</button>
 </div>

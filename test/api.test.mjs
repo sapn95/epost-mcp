@@ -133,11 +133,16 @@ describe('downloads', () => {
     assert.equal(mode, 0o600, `saved as ${mode.toString(8)}`);
   });
 
-  test('saves a thumbnail', async () => {
+  test('saves a thumbnail, and only if it is one', async () => {
     const p = join(out, 'thumb.png');
     const { data } = await srv.call('epost_download_thumbnail', { letter_id: 'inbox-1', output_path: p });
     assert.equal(data.saved, p);
     assert.ok(existsSync(p));
+    // Any 200 used to be saved under this name and reported as a thumbnail,
+    // an HTML error page included. Checking only that a file exists cannot
+    // tell the two apart.
+    assert.deepEqual([...readFileSync(p).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'not a PNG');
+    assert.equal(statSync(p).mode & 0o777, 0o600);
   });
 
   test('reads an archived document and can save it', async () => {

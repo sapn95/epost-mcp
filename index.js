@@ -788,8 +788,16 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   // (close the sheet unchanged) when the document is already filed there.
   const picked = await p.evaluate(({ folderName, add, removeName }) => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-    const boxFor = name => [...document.querySelectorAll('.brand-container')]
-      .find(c => clean(c.innerText) === name && c.offsetParent !== null);
+    // Scoped to the open sheet: .brand-container is also used for decorative
+    // blocks and for the cards behind it, so a document-wide lookup can tick a
+    // box that is not in the sheet at all. And compared NFC-folded, because the
+    // portal serves folder names decomposed while a caller types them composed
+    // — the trap this whole file exists to work around, and the one place that
+    // still compared byte-exactly.
+    const sheet = document.querySelector('[id*="storage-folder-selection"]') || document;
+    const nfc = t => (t || '').normalize('NFC');
+    const boxFor = name => [...sheet.querySelectorAll('.brand-container')]
+      .find(c => nfc(clean(c.innerText)) === nfc(name) && c.offsetParent !== null);
     // The box is a toggle, so clicking is only correct when the current state
     // differs from the state we want. Ticking an existing membership would
     // silently REMOVE it, and vice versa.
@@ -1097,9 +1105,20 @@ async function readStorageDocument(p, { index, title, outputDir }) {
       documentDate: pick(/Document date\s+(\d{2}\.\d{2}\.\d{4})/i),
       amount: pick(/CHF\s+([\d'’,.]+)/),
       // Read the folder from its own element: in the flattened innerText the
-      // name runs into whatever follows it, which is account-specific.
+      // name runs into whatever follows it, which is account-specific. It must
+      // be a VISIBLE one, though — every card behind the open detail carries
+      // the same class, and taking the first in the document reported the
+      // folder of whichever document happened to come first on the page.
       storedIn: (() => {
-        const el = document.querySelector('.storage-location-info');
+        // Anchor on something only the detail has. "Document type" appears in
+        // the open panel and nowhere on a card; the cards behind it all carry
+        // .storage-location-info, and visibility does not separate them
+        // because the panel covers them rather than hiding them. So: the
+        // smallest element that contains both, and its folder.
+        const scope = [...document.querySelectorAll('div, section, article, main')]
+          .filter(n => n.querySelector('.storage-location-info') && /Document type/i.test(n.innerText || ''))
+          .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
+        const el = (scope || document).querySelector('.storage-location-info');
         if (el) return clean(el.innerText).replace(/^Stored in\s*/i, '') || null;
         return pick(/Stored in\s+(.+?)(?=\s+Tracking number|\s+Letter ID|\s+Document type|$)/i);
       })(),
@@ -1151,8 +1170,8 @@ const TOOLS = [
   { name: 'epost_status', description: 'Check whether the ePost session is alive (ok) or an interactive SwissID login is needed (login_required).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_login', description: 'Open a VISIBLE browser window and drive the whole SwissID login except the biometric prompt: it goes to SwissID, fills the account e-mail and requests the passkey, so you only confirm with Touch ID. Falls back to a normal manual login. Caches the session afterwards.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 300)' } } } },
   { name: 'epost_settings', description: 'Show the resolved configuration: which browser is driven and why, whether it can use Touch ID passkeys, the profile/state paths, and whether the SwissID account e-mail is configured.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
+  { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, id, sender, title, date, read). Over the API at most `limit` are returned and the reply says so when that window was filled.', inputSchema: { type: 'object', properties: { limit: { type: 'number', minimum: 1, description: 'how many to fetch over the API (default 200)' } } } },
+  { name: 'epost_download_letter', description: 'Download one letter to output_dir, addressed by list index or by letter_id. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf), written 0600.', inputSchema: { type: 'object', properties: { index: { type: 'number', minimum: 0 }, letter_id: { type: 'string', description: 'instead of index; needs the public API' }, output_dir: { type: 'string' } }, required: ['output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
   { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string', description: 'API letter id (preferred — indices shift)' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
   { name: 'epost_search', description: 'Full-text search across your letters — keywords are matched inside the letter content, not just the metadata. Optionally limit to the inbox or to Storage. API only; there is no equivalent in the portal automation.', inputSchema: { type: 'object', properties: { keyword: { type: 'string' }, location: { type: 'string', enum: ['ALL', 'INBOX', 'STORAGE'], description: 'default ALL' }, limit: { type: 'number' } }, required: ['keyword'] } },
@@ -1168,7 +1187,7 @@ const TOOLS = [
   { name: 'epost_read_storage_document', description: 'Open one Storage document and report what the portal knows about it: the real sender/subject line, document type, date, amount and current folder. The card list only ever shows "Gescannter Brief", so this is the only way to classify an archived document. Pass output_dir to also save the PDF.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string' }, folder_id: { type: 'string' }, output_dir: { type: 'string', description: 'save the PDF here as well' } } } },
   { name: 'epost_create_folder', description: 'Create a new custom folder in the ePost Storage area.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
   { name: 'epost_unfile_from_folder', description: 'Remove a Storage document from a folder. NOTE: the portal will not commit an empty folder set, so this only works when the document is in more than one folder; to empty a folder that holds the document\'s only membership, use epost_move_to_folder with remove_from instead.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' } }, required: ['folder'] } },
-  { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership; it is idempotent (no-op if already filed there) and never removes an existing membership. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
+  { name: 'epost_move_to_folder', description: 'File a Storage document into a custom folder (addressed by index in the loaded My-Documents list, or by a text substring such as a date). Pass remove_from to re-file: the old folder is unticked in the same sheet, which is the only way to empty a folder that holds the document\'s only membership. ePost documents can belong to several folders, so this ADDS the folder membership: it is idempotent (no-op if already filed there) and removes nothing unless remove_from says which. Note: filing a document bumps it to the top of the "Last used" order, so re-list before addressing the next one by index.', inputSchema: { type: 'object', properties: { index: { type: 'number', minimum: 0 }, title: { type: 'string' }, folder: { type: 'string' }, remove_from: { type: 'string', description: 'folder to drop in the same step (re-file)' } }, required: ['folder'] } },
 ];
 
 const server = new Server({ name: PKG.name, version: PKG.version }, { capabilities: { tools: {} } });
@@ -1410,6 +1429,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       const bytes = await apiThumbnail(args.letter_id);
       if (!bytes) return text({ error: 'needs the API', hint: apiUnavailable });
       mkdirSync(dirname(args.output_path), { recursive: true });
+      // Any 200 used to count. A portal or proxy that answers with JSON or an
+      // HTML error page was saved under the name of a thumbnail and reported as
+      // one. PNG, JPEG and GIF are what the endpoint serves.
+      const sig = bytes.subarray(0, 4).toString('latin1');
+      if (!(sig.startsWith('\x89PNG') || sig.startsWith('\xff\xd8') || sig.startsWith('GIF8'))) {
+        return text({ error: `the thumbnail endpoint did not answer with an image (${bytes.length} bytes)`, hint: 'the letter may not have one yet' });
+      }
       writeFileSync(args.output_path, bytes, { mode: 0o600 });
       chmodSync(args.output_path, 0o600);
       return text({ transport: 'api', saved: args.output_path, bytes: bytes.length });
