@@ -34,7 +34,7 @@ const menu = i => `
   </div>`;
 
 const card = (d, i) => `
-<div class="letter-wrapper letter small-letter">
+<div class="letter-wrapper letter small-letter" data-folders="${d.stored || ''}">
   <div class="letter-content" onclick="openDetail(${i})">
     <div class="sender-info--small"><span class="sender-name">${d.sender || 'ePost Scancenter'}</span>
       <span class="letter-content__date letter-date">${d.date}</span></div>
@@ -71,7 +71,19 @@ ${body}
 ${sheet()}
 <script>
   let current = null;
-  function store(i){ current = i; document.getElementById('storage-folder-selection').style.display='block'; }
+  function store(i){
+    current = i;
+    // The real sheet opens with the document's current folders already ticked.
+    // A sheet that always opened empty made unfiling look like a no-op, so the
+    // one path that has to refuse — removing the last folder — never ran.
+    const owned = (document.querySelectorAll('.letter-wrapper')[i]?.dataset.folders || '')
+      .split('|').filter(Boolean);
+    document.querySelectorAll('#storage-folder-selection .brand-container').forEach(c => {
+      const name = c.querySelector('span').textContent;
+      c.querySelector('.ui-chkbox-box').classList.toggle('ui-state-active', owned.includes(name));
+    });
+    document.getElementById('storage-folder-selection').style.display='block';
+  }
   function closeSheet(){ document.getElementById('storage-folder-selection').style.display='none'; }
   function commit(){
     const on = [...document.querySelectorAll('#storage-folder-selection .brand-container')]
@@ -87,8 +99,11 @@ ${sheet()}
   }
 </script>
 <div id="detail" style="display:none">
+  <!-- The sender begins with a C on purpose: the subject was once matched with
+       a pattern that excluded that letter, so every such name came back null. -->
+  <div>Gescannter Brief Invoice from Caramba Example AG CHF 42.00</div>
   <div>Document type Invoice</div><div>Document date 02.02.2020</div>
-  <div>Stored in Example_Alpha</div>
+  <div class="storage-location-info"><span>Stored in </span> <b>Example_Alpha</b></div>
   <a id="dl" download="letter.pdf" href="data:application/pdf;base64,JVBERi0xLjQgbW9jaw==">Download File</a>
   <button onclick="document.getElementById('dl').click()">Download File</button>
 </div>

@@ -476,6 +476,13 @@ async function listLetters(p) {
       index: i,
       sender: pick('.sender-name'),
       title: pick('.letter-title-name'),
+      // The API row reports a single `date`, and apiLetterRow claims the two
+      // transports hand a client the same thing. They did not: this side only
+      // ever exposed the raw list, so a client that fell back to the browser
+      // read `undefined` from a field that worked a moment earlier. A card can
+      // show more than one date, so both are reported — the first is the one
+      // printed next to the sender.
+      date: dates[0] || null,
       dates,
       preview: el.innerText.replace(/\s+/g, ' ').slice(0, 120),
     };
@@ -726,6 +733,24 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
     }
   }
   await p.waitForTimeout(2500);
+
+  // The portal refuses to commit an empty folder set, and it says so by simply
+  // leaving the sheet open. Returning "moved" on that would tell the caller a
+  // document had left a folder it is in fact still in — a wrong answer is worse
+  // here than an error, because nothing downstream can tell the two apart.
+  const sheet = p.locator('[id*="storage-folder-selection"]').first();
+  if (await sheet.isVisible().catch(() => false)) {
+    const cancel = p.locator('[id$=":cancel"]').first();
+    if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
+    return {
+      status: 'refused',
+      folder,
+      reason: 'the portal did not accept the folder sheet',
+      hint: add
+        ? 'the sheet stayed open — the folder may no longer be offered for this document'
+        : 'a document cannot be left in no folder at all; use epost_move_to_folder with a destination instead',
+    };
+  }
   return { status: 'ok', moved: { index, title, folder } };
 }
 
@@ -933,7 +958,14 @@ async function readStorageDocument(p, { index, title, outputDir }) {
     const body = clean(document.body.innerText);
     const pick = re => (re.exec(body) || [])[1]?.trim() || null;
     return {
-      subject: pick(/Gescannter Brief\s+(Invoice from [^C]+?)(?=\s+CHF|\s+Document type)/i),
+      // Every card behind the detail also says "Gescannter Brief", so an
+      // unconstrained match starts at the first one and swallows the whole list
+      // down to the first amount. The subject may therefore not cross another
+      // occurrence, which pins the match to the detail's own heading.
+      // An earlier version excluded the letter C instead, to stop before "CHF".
+      // That worked by accident and returned null for every sender whose name
+      // begins with one — Coop, CSS, Concordia — and for anything not an invoice.
+      subject: pick(/Gescannter Brief\s+((?:(?!Gescannter Brief).)+?)(?=\s+CHF\b|\s+Document type|$)/i),
       documentType: pick(/Document type\s+(\S+)/i),
       documentDate: pick(/Document date\s+(\d{2}\.\d{2}\.\d{4})/i),
       amount: pick(/CHF\s+([\d'’,.]+)/),
@@ -1071,17 +1103,30 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         },
       });
     }
-    // The page the browser-backed tools work on. Resolved here rather than at
-    // the top of the dispatcher so that API-only calls — and epost_settings —
-    // never pay for a browser launch.
-    const p = await getPage();
+    // The page the browser-backed tools work on, resolved on first use. It used
+    // to be launched here for every tool, which the comment claimed it was not:
+    // `epost_search`, `epost_get_letter` and `epost_unread_count` are served
+    // entirely by the API and never touch it, yet they launched a browser — and
+    // failed outright where none is installed, which is precisely the situation
+    // the API transport exists for.
+    let pending = null;
+    const p = () => {
+      // `browser` was enforced; `api` was not, so pinning to the API still fell
+      // through to the portal whenever a call could not be served — quietly
+      // doing something other than what was asked, on a machine that may have
+      // no browser at all. A pin now means what it says in both directions.
+      if (TRANSPORT === 'api') {
+        throw new Error(`${name} needs the browser, and EPOST_TRANSPORT=api pins this server to the public API — unset it or set it to "auto" to allow the fallback`);
+      }
+      return (pending ??= getPage());
+    };
 
     if (name === 'epost_list_letters') {
       const viaApi = await apiListLetters(args.limit || 200);
       if (viaApi) return text({ transport: 'api', count: viaApi.length, letters: viaApi.map(apiLetterRow) });
-      const st = await ensureSession(p);
+      const st = await ensureSession(await p());
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
-      const out = await listLetters(p);
+      const out = await listLetters(await p());
       await saveState();
       return text(out);
     }
@@ -1100,19 +1145,19 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
       }
-      const st = await ensureSession(p);
+      const st = await ensureSession(await p());
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
-      const letters = await listLetters(p);
-      const saved = await downloadLetter(p, args.index, args.output_dir, letters[args.index]);
+      const letters = await listLetters(await p());
+      const saved = await downloadLetter(await p(), args.index, args.output_dir, letters[args.index]);
       await saveState();
       return text({ saved });
     }
     if (name === 'epost_download_all') {
-      const st = await ensureSession(p);
+      const st = await ensureSession(await p());
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
-      const letters = await listLetters(p);
+      const letters = await listLetters(await p());
       const saved = [];
-      for (const l of letters) saved.push(await downloadLetter(p, l.index, args.output_dir, l));
+      for (const l of letters) saved.push(await downloadLetter(await p(), l.index, args.output_dir, l));
       await saveState();
       return text({ count: saved.length, saved });
     }
@@ -1146,9 +1191,12 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
       }
-      const out = await storeLetter(p, { index: args.index, title: args.title, folder: args.folder });
+      // Only a session problem is a session problem: flattening every non-ok
+      // status into "log in again" sent the caller to the wrong remedy the moment
+      // a tool grew a second failure mode, such as a sheet the portal refused.
+      const out = await storeLetter(await p(), { index: args.index, title: args.title, folder: args.folder });
       await saveState();
-      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_search') {
@@ -1208,9 +1256,9 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           companyFolders: dirs.filter(d => !d.directoryId).map(d => ({ name: d.directoryName, count: d.numberOfDocuments })),
         });
       }
-      const out = await listStorage(p);
+      const out = await listStorage(await p());
       await saveState();
-      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_list_storage_documents') {
@@ -1221,9 +1269,9 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         const items = Array.isArray(viaApi) ? viaApi : (viaApi.letters || viaApi.content || []);
         return text({ transport: 'api', count: items.length, documents: items.map(apiLetterRow) });
       }
-      const out = await listStorageDocuments(p, { scrollAll: args.scroll_all === true });
+      const out = await listStorageDocuments(await p(), { scrollAll: args.scroll_all === true });
       await saveState();
-      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_read_storage_document') {
@@ -1249,27 +1297,27 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           return text({ transport: 'api', ...apiLetterRow(l, args.index ?? 0), saved });
         }
       }
-      const out = await readStorageDocument(p, { index: args.index, title: args.title, outputDir: args.output_dir });
+      const out = await readStorageDocument(await p(), { index: args.index, title: args.title, outputDir: args.output_dir });
       await saveState();
-      if (out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_create_folder') {
-      const out = await createFolder(p, args.name);
+      const out = await createFolder(await p(), args.name);
       await saveState();
-      if (out.status && out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_unfile_from_folder') {
-      const out = await moveToFolder(p, { index: args.index, title: args.title, folder: args.folder, add: false });
+      const out = await moveToFolder(await p(), { index: args.index, title: args.title, folder: args.folder, add: false });
       await saveState();
-      if (out.status && out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     if (name === 'epost_move_to_folder') {
-      const out = await moveToFolder(p, { index: args.index, title: args.title, folder: args.folder, remove: args.remove_from || null });
+      const out = await moveToFolder(await p(), { index: args.index, title: args.title, folder: args.folder, remove: args.remove_from || null });
       await saveState();
-      if (out.status && out.status !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
+      if (out.status === 'login_required') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       return text(out);
     }
     return text({ error: `unknown tool ${name}` });
