@@ -194,29 +194,24 @@ security add-generic-password -a epost -s epost-mcp-swissid-user \
 and whether the account e-mail is configured. Run it first if a login surprises
 you.
 
-### Why the login cannot be fully unattended
+### Why the login is not fully unattended
 
-The tempting idea is a *software* passkey via Chrome's WebAuthn virtual
-authenticator, so the server could sign the login itself. That mechanism works
-in general — verified end to end against a local relying party — but SwissID
-rejects it, and says so plainly:
+Everything except the biometric prompt is driven. That is the ceiling, not a
+shortcoming of the implementation: a passkey cannot be used without genuine user
+presence.
 
-```
+The tempting shortcut — a *software* passkey through Chrome's WebAuthn virtual
+authenticator, so the server could sign the login itself — was built, tried, and
+removed. SwissID rejects software authenticators outright:
+
+```text
 POST /api-login/authenticate/webauthn-register  ->  400
-ERROR::WebauthnVendorNotAllowed: This webauthn passkey authenticator vendor is not allowed by SwissID
+ERROR::WebauthnVendorNotAllowed
 ```
 
-SwissID requests attestation and checks the authenticator's **AAGUID** (its
-vendor id) against an allow-list of approved hardware makers. The credential was
-created successfully on all six attempts; the server refused every one. Getting
-past that would mean forging an approved vendor's identity, which is precisely
-the control being enforced, so this project does not attempt it.
-
-A real Touch ID passkey cannot be automated either: a platform authenticator
-requires genuine user presence, by design. Hence the split above — automate all
-of it except the fingerprint. `epost_passkey_register` / `_status` / `_forget`
-remain for relying parties that do accept software authenticators, and
-registration only reports success once the server has stored the credential.
+It was removed rather than kept "just in case": it could never work against the
+one service this server talks to, and it wrote an exportable private key into
+the login keychain — a standing risk in exchange for nothing.
 
 ## Register in Claude Code
 
@@ -393,7 +388,8 @@ there is no credential, by design.
 
 ## Checks
 
-    npm test
+    npm run gate      # lint + smoke + hygiene + tests with coverage enforced
+    npm test          # just the tests
 
 Runs exactly what CI runs, offline and without credentials: a syntax check, the
 protocol smoke test and the hygiene scan.

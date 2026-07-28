@@ -1,0 +1,102 @@
+// A stand-in for api.epost.ch, so the API layer can be exercised without going
+// near the real account. Speaks the shapes the real service returns, including
+// the awkward ones: the archive listing carries no folder field, folder names
+// come back NFD-normalised, and /archive refuses a letter that is already in
+// Storage.
+import { createServer } from 'node:http';
+
+export const DIRECTORIES = [
+  { directoryId: 'dir-one', directoryName: 'Example_Alpha', numberOfDocuments: 2, hasSubDirectories: false },
+  // deliberately NFD: the umlaut is a + combining diaeresis, as the service sends it
+  { directoryId: 'dir-two', directoryName: 'Example_Ümlaut', numberOfDocuments: 1, hasSubDirectories: false },
+  { directoryId: '', directoryName: 'ePost Scancenter', numberOfDocuments: 3, hasSubDirectories: false },
+];
+
+const letter = (id, over = {}) => ({
+  id,
+  letterTitle: 'Gescannter Brief',
+  fileName: `${id}.pdf`,
+  documentTypes: ['Invoice'],
+  letterContentReference: `/epost/v2/letters/${id}/content`,
+  letterType: 'CLASSIC_LETTER',
+  receivedDateTime: '2020-02-02T11:02:37.275Z',
+  description: 'Invoice from Someone AG',
+  readStatus: 'UNREAD',
+  ...over,
+});
+
+export function start() {
+  const state = {
+    inbox: [letter('inbox-1'), letter('inbox-2', { description: null, readStatus: 'READ' })],
+    archive: [letter('arch-1'), letter('arch-2', { description: null }), letter('arch-3')],
+    inFolder: { 'dir-one': ['arch-1'], 'dir-two': ['arch-3'] },   // arch-2 is unfiled
+    deleted: [letter('del-1')],
+    calls: [],
+  };
+
+  const srv = createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const p = url.pathname;
+    state.calls.push(`${req.method} ${p}`);
+    const send = (code, body, type = 'application/json') => {
+      res.writeHead(code, { 'Content-Type': type });
+      res.end(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body));
+    };
+    const auth = req.headers.authorization || '';
+    const key = req.headers['x-api-key'];
+
+    if (p === '/core/latest/tenants' && req.method === 'POST') {
+      return send(200, [{ tenant_id: 't-1', company_id: 0, company_name: 'Test' }]);
+    }
+    if (p === '/core/latest/token' && req.method === 'POST') {
+      return send(200, { access_token: 'tok-abc', token_type: 'Bearer', expires_in: 600, refresh_expires_in: 1800 });
+    }
+    // everything below needs one of the two documented schemes
+    if (!auth.startsWith('Bearer ') && !key) return send(401, { error: 'unauthorized' });
+
+    if (p === '/epost/v2/letters' && req.method === 'GET') return send(200, state.inbox);
+    if (p === '/epost/v2/letters/deleted') return send(200, state.deleted);
+    if (p === '/epost/v2/letters/inbox/count') return send(200, { count: state.inbox.filter(l => l.readStatus === 'UNREAD').length });
+    if (p === '/epost/v2/letters/search') {
+      const k = (url.searchParams.get('keyword') || '').toLowerCase();
+      return send(200, [...state.inbox, ...state.archive].filter(l => JSON.stringify(l).toLowerCase().includes(k)));
+    }
+    if (p === '/epost/v2/letters/read' && req.method === 'POST') return send(204, '');
+    if (p === '/epost/v2/archives/directories') return send(200, DIRECTORIES);
+    if (p === '/epost/v2/archives/letters') {
+      const d = url.searchParams.get('directory-id');
+      if (d) return send(200, state.archive.filter(l => (state.inFolder[d] || []).includes(l.id)));
+      return send(200, state.archive);           // note: no folder field, like the real one
+    }
+    const m = /^\/epost\/v2\/letters\/([^/]+)(\/.*)?$/.exec(p);
+    if (m) {
+      const [, id, tail] = m;
+      const known = [...state.inbox, ...state.archive].find(l => l.id === id);
+      if (!known) return send(404, { error: 'not_found' });
+      if (tail === '/content') return send(200, Buffer.from('%PDF-1.4 mock'), 'application/octet-stream');
+      if (tail === '/thumbnail') return send(200, Buffer.from('\x89PNG mock'), 'image/png');
+      if (tail === '/restore' && req.method === 'POST') return send(204, '');
+      if (tail === '/archive' && req.method === 'PATCH') {
+        if (state.archive.some(l => l.id === id)) {
+          return send(400, { error: 'bad_request', error_description: 'Letter is already archived!' });
+        }
+        const dir = url.searchParams.get('destination-directory-id');
+        state.inbox = state.inbox.filter(l => l.id !== id);
+        state.archive.push(known);
+        if (dir) state.inFolder[dir] = [...(state.inFolder[dir] || []), id];
+        return send(204, '');
+      }
+      if (!tail && req.method === 'GET') return send(200, known);
+      if (!tail && req.method === 'DELETE') return send(204, '');
+    }
+    return send(404, { error: 'no_route', path: p });
+  });
+
+  return new Promise(resolve => {
+    srv.listen(0, '127.0.0.1', () => resolve({
+      base: `http://127.0.0.1:${srv.address().port}`,
+      state,
+      close: () => new Promise(r => srv.close(r)),
+    }));
+  });
+}

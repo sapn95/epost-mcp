@@ -15,8 +15,11 @@
     "postinstall-hint": "npx playwright install chromium",
     "smoke": "node scripts/smoke.mjs",
     "hygiene": "node scripts/hygiene.mjs",
-    "test": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs",
-    "prepublishOnly": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs"
+    "test": "node --test --test-concurrency=1 test/api.test.mjs test/browser.test.mjs",
+    "prepublishOnly": "node --check index.js && node scripts/smoke.mjs && node scripts/hygiene.mjs",
+    "coverage": "c8 --reporter=text-summary --include=index.js --check-coverage --lines 80 --functions 90 node --test --test-concurrency=1 test/api.test.mjs test/browser.test.mjs",
+    "gate": "npm run lint && node scripts/smoke.mjs && node scripts/hygiene.mjs && npm run coverage",
+    "lint": "eslint ."
   },
   "keywords": [
     "mcp",
@@ -51,5 +54,10 @@
   },
   "overrides": {
     "@hono/node-server": "^2.0.12"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "c8": "^12.0.0",
+    "eslint": "^10.8.0"
   }
 }
