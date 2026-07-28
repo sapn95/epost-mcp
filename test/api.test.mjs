@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
-import { start } from './mock-epost.mjs';
+import { start, TOKEN } from './mock-epost.mjs';
 import { startServer } from './client.mjs';
 
 let mock, srv, out;
@@ -186,11 +186,22 @@ describe('safety', () => {
     assert.match(data.note, /restore/i);
   });
 
+  test('an upstream error that quotes the credentials back is redacted', async () => {
+    // The body of a failed call can be made of the request that produced it —
+    // a proxy echoing the Authorization header, a gateway quoting the form it
+    // rejected. It used to travel into the tool result verbatim.
+    const { raw } = await srv.call('epost_get_letter', { letter_id: 'echo-secret' });
+    assert.match(raw, /500/, 'the failure itself is still reported');
+    assert.ok(!raw.includes('test-password'), `the password surfaced: ${raw.slice(0, 200)}`);
+    assert.ok(!raw.includes(TOKEN), 'the bearer token surfaced');
+    assert.ok(raw.includes('***'), 'and it is visible that something was removed');
+  });
+
   test('never echoes the password or the token', async () => {
     const { data } = await srv.call('epost_settings');
     const blob = JSON.stringify(data) + srv.stderr();
     assert.ok(!blob.includes('test-password'), 'password must not surface');
-    assert.ok(!blob.includes('tok-abc'), 'token must not surface');
+    assert.ok(!blob.includes(TOKEN), 'token must not surface');
     assert.match(data.swissid_user, /\*\*\*/, 'the account is masked');
   });
 });

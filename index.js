@@ -281,6 +281,29 @@ function apiCredentials() {
   return user && password ? { user, password } : null;
 }
 
+// An upstream error body can be made of the request that produced it — a proxy
+// echoing the Authorization header, a gateway quoting the form it rejected. The
+// body reaches the model through a tool result, so anything we hold is stripped
+// out of it first, in each shape it could have travelled in. The sister server
+// has had this since it was written; this one had nothing.
+function redact(s) {
+  let out = String(s ?? '');
+  const secrets = [
+    process.env.EPOST_API_PASSWORD, process.env.EPOST_API_KEY,
+    apiKey(), envOrKeychain('EPOST_API_PASSWORD', KC_API_PASSWORD),
+    apiToken?.value,
+  ];
+  for (const v of secrets) {
+    // Short values are left alone: mangling every occurrence of a four-character
+    // string would make errors unreadable, and no real credential is that short.
+    if (typeof v !== 'string' || v.length < 8) continue;
+    for (const form of new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)])) {
+      out = out.split(form).join('***');
+    }
+  }
+  return out;
+}
+
 async function apiFetch(method, path, { params, form, json, token, raw } = {}) {
   const url = new URL(path, API_BASE);
   for (const [k, v] of Object.entries(params || {})) {
@@ -300,7 +323,9 @@ async function apiFetch(method, path, { params, form, json, token, raw } = {}) {
   }
   const res = await fetch(url, { method, headers, body });
   if (!res.ok) {
-    const detail = (await res.text().catch(() => '')).slice(0, 200);
+    // Redact first, cut second: truncating mid-credential leaves a fragment the
+    // redactor no longer recognises.
+    const detail = redact(await res.text().catch(() => '')).slice(0, 200);
     const err = new Error(`${method} ${path} -> ${res.status}${detail ? ` ${detail}` : ''}`);
     err.status = res.status;
     throw err;
@@ -526,7 +551,11 @@ async function ensureLetterbox(p, timeout = 40000) {
 }
 
 async function listLetters(p) {
-  await p.waitForSelector('div.letter-wrapper', { timeout: 20000 });
+  // An empty letterbox has no cards, and waiting for one used to mean twenty
+  // seconds followed by a thrown timeout — an inbox with nothing in it reported
+  // as a failure. Waiting is still right when cards are on their way, so give
+  // up quietly and let the extraction return nothing.
+  await p.waitForSelector('div.letter-wrapper', { timeout: 20000 }).catch(() => {});
   return p.$$eval('div.letter-wrapper', els => els.map((el, i) => {
     const pick = sel => { const n = el.querySelector(sel); return n ? n.innerText.replace(/\s+/g, ' ').trim() : ''; };
     const dates = [...el.innerText.matchAll(/\d{2}\.\d{2}\.\d{4}/g)].map(m => m[0]);
@@ -1207,7 +1236,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       const signed = browserChoice.key && browserChoice.key !== 'chromium';
       return text({
         transport: TRANSPORT,
-        api: apiUnavailable ? `unavailable: ${apiUnavailable}`
+        api: apiUnavailable ? `unavailable: ${redact(apiUnavailable)}`
           : [apiCredentials() && 'password grant', apiKey() && 'X-API-KEY'].filter(Boolean).join(' + ')
             || 'no credentials configured',
         browser: {
@@ -1219,7 +1248,11 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           ? (signed ? 'expected to work (signed system browser)'
             : 'NOT available — the bundled Chromium cannot reach the platform authenticator; set EPOST_BROWSER=chrome')
           : 'unknown until a browser is launched',
-        swissid_user: user ? user.replace(/^(.).*(@.*)$/, '$1***$2')
+        // Masked whatever shape it has. The pattern only matched an e-mail, so a
+        // value that was not one — a misconfiguration, or a secret pasted into
+        // the wrong variable — came back verbatim.
+        swissid_user: user
+          ? (/^.+@.+$/.test(user) ? user.replace(/^(.).*(@.*)$/, '$1***$2') : `${user[0]}*** (${user.length} chars, not an e-mail)`)
           : 'not set — epost_login cannot skip the e-mail step',
         paths: { state: STATE, profile: PROFILE },
         settings: {
@@ -1237,8 +1270,18 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
 
     if (name === 'epost_list_letters') {
-      const viaApi = await apiListLetters(args.limit || 200);
-      if (viaApi) return text({ transport: 'api', count: viaApi.length, letters: viaApi.map(apiLetterRow) });
+      const limit = args.limit || 200;
+      const viaApi = await apiListLetters(limit);
+      if (viaApi) {
+        // A full page is indistinguishable from a complete inbox, and a caller
+        // that looked up a letter by id in this list would be told it does not
+        // exist. Say so rather than presenting a window as the whole thing.
+        const truncated = viaApi.length >= limit;
+        return text({
+          transport: 'api', count: viaApi.length, letters: viaApi.map(apiLetterRow),
+          ...(truncated ? { truncated: true, hint: `exactly ${limit} came back, so there may be more — raise limit` } : {}),
+        });
+      }
       const st = await ensureSession(await p());
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const out = await listLetters(await p());
@@ -1396,12 +1439,25 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // Over the API a Storage document is just a letter with an id: the listing
       // already carries the description, and the same content endpoint serves
       // the PDF. No card to open, no viewer to drive.
+      // folder_id and letter_id only mean anything to the API. Falling through to
+      // the browser with either of them set silently re-reads the request as
+      // "whatever is at that position in the whole of Storage" — a different
+      // document, downloaded and reported as the one that was asked for.
+      const apiOnly = args.folder_id || args.letter_id;
       const arch = await apiListArchive(args.folder_id, 1000);
+      if (!arch && apiOnly) {
+        return text({ error: 'this needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'folder_id and letter_id cannot be honoured through the portal — drop them to read by position instead' });
+      }
       if (arch) {
         const items = Array.isArray(arch) ? arch : (arch.letters || arch.content || []);
         const l = args.letter_id ? items.find(x => x.id === args.letter_id)
           : typeof args.index === 'number' ? items[args.index]
             : args.title ? items.find(x => JSON.stringify(x).includes(args.title)) : null;
+        // The API answered and there is no such document. Asking the browser the
+        // same question with a different meaning of "index" is not a fallback.
+        if (!l && apiOnly) {
+          return text({ error: 'no such document in Storage', folder_id: args.folder_id ?? null, letter_id: args.letter_id ?? null });
+        }
         if (l) {
           let saved = null;
           if (args.output_dir) {
@@ -1445,7 +1501,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     return text({ error: `unknown tool ${name}` });
   } catch (e) {
-    return { content: [{ type: 'text', text: 'ERROR: ' + (e.message || String(e)) }], isError: true };
+    return { content: [{ type: 'text', text: redact('ERROR: ' + (e.message || String(e))) }], isError: true };
   } finally {
     // Whatever happened, the next caller gets the browser.
     releaseBrowser?.();
