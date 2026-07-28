@@ -95,9 +95,15 @@ describe('reading', () => {
     assert.equal(data.unread, 2, 'inbox-2 is the only one marked read');
   });
 
-  test('searches inside letter content', async () => {
+  test('searches inside letter content, and returns only what matched', async () => {
+    // "at least one result" passed for an implementation that ignored the
+    // keyword entirely and handed back the whole letterbox.
     const { data } = await srv.call('epost_search', { keyword: 'Someone' });
     assert.ok(data.count >= 1);
+    assert.ok(data.letters.every(l => JSON.stringify(l).includes('Someone')),
+      `something that does not match came back: ${JSON.stringify(data.letters.map(l => l.id))}`);
+    const none = await srv.call('epost_search', { keyword: 'no-letter-says-this' });
+    assert.equal(none.data.count, 0, 'a keyword nothing contains still matched something');
   });
 
   test('lists the trash', async () => {
@@ -215,10 +221,18 @@ describe('safety', () => {
     assert.ok(!mock.state.calls.some(c => c.startsWith('DELETE ')), 'nothing was deleted');
   });
 
-  test('deletes only when confirmed, and says it is recoverable', async () => {
-    const { data } = await srv.call('epost_delete_letter', { letter_id: 'inbox-1', confirm: true });
-    assert.equal(data.deleted, 'inbox-1');
+  test('deletes only when confirmed, and the letter really moves to the trash', async () => {
+    // This is the destructive test, and it only ever read back the handler's
+    // own echo: code that issued no DELETE at all, or deleted something else,
+    // passed it.
+    // inbox-2 is archived by an earlier test in this file; inbox-3 stays put.
+    assert.ok(mock.state.inbox.some(l => l.id === 'inbox-3'), 'inbox-3 starts in the inbox');
+    const { data } = await srv.call('epost_delete_letter', { letter_id: 'inbox-3', confirm: true });
+    assert.equal(data.deleted, 'inbox-3');
     assert.match(data.note, /restore/i);
+    assert.ok(mock.state.calls.includes('DELETE /epost/v2/letters/inbox-3'), 'no DELETE was sent');
+    assert.ok(!mock.state.inbox.some(l => l.id === 'inbox-3'), 'it did not leave the inbox');
+    assert.ok(mock.state.deleted.some(l => l.id === 'inbox-3'), 'it did not arrive in the trash');
   });
 
   test('an upstream error that quotes the credentials back is redacted', async () => {

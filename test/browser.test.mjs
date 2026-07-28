@@ -123,8 +123,12 @@ describe('portal automation', () => {
 
   test('a login that never authenticates reports login_required, not success', SLOW, async () => {
     // The fixture has no SwissID chain, so the assisted login can only time out.
-    // What matters is that it says so rather than claiming a session.
-    const { data } = await srv.call('epost_login', { wait_seconds: 5 });
+    // What matters is that it says so rather than claiming a session. 30 is the
+    // documented minimum — anything shorter is clamped, and a test that asked
+    // for five seconds and waited thirty implied a promise the code never made.
+    const started = Date.now();
+    const { data } = await srv.call('epost_login', { wait_seconds: 30 });
+    assert.ok(Date.now() - started >= 29000, 'it returned before the window it was given');
     assert.equal(data.status, 'login_required',
       'no authenticated session exists, so login must not claim one');
     assert.ok(data.hint || data.browser, 'it says what the caller should do next');
