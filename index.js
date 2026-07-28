@@ -21,7 +21,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { chromium } from 'playwright';
-import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, rmSync, chmodSync, openSync, writeSync, fchmodSync, closeSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -180,6 +180,21 @@ function checkIndex(index, n, what) {
   if (!Number.isInteger(index) || index < 0 || index >= n) {
     throw new Error(`index ${index} out of range (${n} ${what})`);
   }
+}
+
+// Write bytes to a path the caller named, and only to a path.
+//
+// writeFileSync takes a number as a FILE DESCRIPTOR, so output_path: 2 wrote a
+// letter to stderr and output_path: 1 wrote it into the MCP stream itself. It
+// also follows a symlink at the destination, and mode: only applies to a file
+// it creates — an existing world-readable file kept its permissions until the
+// chmod afterwards. O_NOFOLLOW and an explicit 0600 close all three.
+function writePrivate(path, bytes) {
+  if (typeof path !== 'string' || !path.trim()) {
+    throw new Error(`output path must be a path, not ${typeof path}`);
+  }
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+  try { writeSync(fd, bytes); fchmodSync(fd, 0o600); } finally { closeSync(fd); }
 }
 
 // A file name is assembled from values the service supplies — a letter id, a
@@ -1312,6 +1327,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // it was not — a shape that changed under them for reasons of their own.
       return text({ transport: 'browser', count: out.length, letters: out });
     }
+    if (name === 'epost_download_letter' || name === 'epost_download_all' || name === 'epost_read_storage_document') {
+      // mkdirSync takes no descriptors, but it does accept a number and then
+      // fails somewhere less legible than here.
+      if (args.output_dir !== undefined && (typeof args.output_dir !== 'string' || !args.output_dir.trim())) {
+        throw new Error(`output_dir must be a path, not ${typeof args.output_dir}`);
+      }
+    }
     if (name === 'epost_download_letter') {
       const apiLetters = await apiListLetters(200);
       if (apiLetters) {
@@ -1324,8 +1346,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             const saved = join(args.output_dir, `${namePart(stamp)}_ePost_${namePart(args.index ?? l.id)}.pdf`);
             // Correspondence: written with the process umask it can land
             // group- and world-readable.
-            writeFileSync(saved, bytes, { mode: 0o600 });
-            chmodSync(saved, 0o600);
+            writePrivate(saved, bytes);
             return text({ transport: 'api', saved, bytes: bytes.length, description: l.description });
           }
         }
@@ -1426,6 +1447,11 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         : { error: 'needs the API', hint: apiUnavailable });
     }
     if (name === 'epost_download_thumbnail') {
+      // Checked before anything else touches it: dirname() on a number throws
+      // a TypeError about paths, which is true but says nothing useful.
+      if (typeof args.output_path !== 'string' || !args.output_path.trim()) {
+        throw new Error(`output_path must be a path, not ${typeof args.output_path}`);
+      }
       const bytes = await apiThumbnail(args.letter_id);
       if (!bytes) return text({ error: 'needs the API', hint: apiUnavailable });
       mkdirSync(dirname(args.output_path), { recursive: true });
@@ -1436,8 +1462,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       if (!(sig.startsWith('\x89PNG') || sig.startsWith('\xff\xd8') || sig.startsWith('GIF8'))) {
         return text({ error: `the thumbnail endpoint did not answer with an image (${bytes.length} bytes)`, hint: 'the letter may not have one yet' });
       }
-      writeFileSync(args.output_path, bytes, { mode: 0o600 });
-      chmodSync(args.output_path, 0o600);
+      writePrivate(args.output_path, bytes);
       return text({ transport: 'api', saved: args.output_path, bytes: bytes.length });
     }
     if (name === 'epost_list_storage') {
@@ -1499,8 +1524,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
               saved = join(args.output_dir, `${namePart((l.receivedDateTime || '').slice(0, 10) || 'undated')}_ePostStorage_${namePart(args.index ?? l.id)}.pdf`);
               // Correspondence: written with the process umask it can land
             // group- and world-readable.
-            writeFileSync(saved, bytes, { mode: 0o600 });
-            chmodSync(saved, 0o600);
+            writePrivate(saved, bytes);
             }
           }
           // Same rule as the browser path: asking for the file and being told
