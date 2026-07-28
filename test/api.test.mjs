@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
-import { start, TOKEN } from './mock-epost.mjs';
+import { start, TOKEN, API_KEY } from './mock-epost.mjs';
 import { startServer } from './client.mjs';
 
 let mock, srv, out;
@@ -46,7 +46,7 @@ describe('authentication', () => {
   test('an API key alone authenticates, without the password grant', async () => {
     const s = await startServer({
       EPOST_API_BASE: mock.base, EPOST_TRANSPORT: 'api',
-      EPOST_API_PASSWORD: '', EPOST_SWISSID_USER: '', EPOST_API_KEY: 'k-123',
+      EPOST_API_PASSWORD: '', EPOST_SWISSID_USER: '', EPOST_API_KEY: API_KEY,
     });
     const { data } = await s.call('epost_list_letters');
     assert.equal(data.transport, 'api', 'the key alone should be enough');
@@ -113,10 +113,14 @@ describe('reading', () => {
 });
 
 describe('downloads', () => {
-  test('saves a letter as a real file', async () => {
+  test('saves the letter that was asked for, not just some letter', async () => {
+    // Every mock PDF used to be byte-identical, so a download that fetched a
+    // different letter's content was indistinguishable from a correct one.
     const { data } = await srv.call('epost_download_letter', { index: 0, output_dir: out });
     assert.ok(existsSync(data.saved), 'file written');
-    assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'looks like a PDF');
+    const body = readFileSync(data.saved).toString();
+    assert.ok(body.startsWith('%PDF'), 'looks like a PDF');
+    assert.match(body, /inbox-1/, `fetched a different letter: ${body.slice(0, 40)}`);
   });
 
   test('a path-shaped value from the service cannot steer the file out of output_dir', async () => {
@@ -161,10 +165,13 @@ describe('downloads', () => {
     }
   });
 
-  test('reads an archived document and can save it', async () => {
+  test('reads an archived document with its folder, and can save it', async () => {
+    // The raw archive listing carries no folder field, so storedIn came back
+    // absent for every document while the tool promises the current folder.
     const { data } = await srv.call('epost_read_storage_document', { index: 0, output_dir: out });
     assert.equal(data.transport, 'api');
     assert.ok(existsSync(data.saved));
+    assert.deepEqual(data.storedIn, ['Example_Alpha'], `no folder reported: ${JSON.stringify(data.storedIn)}`);
   });
 });
 
