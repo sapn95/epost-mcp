@@ -928,7 +928,13 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
 // Where the browser is, with nothing that could be replayed: OIDC steps carry a
 // code, a state and a session id in the query string.
 function safeUrl(u) {
-  try { const x = new URL(u); return `${x.origin}${x.pathname}${x.search ? '?…' : ''}`; }
+  try {
+    const x = new URL(u);
+    // An opaque URL has no origin: new URL('about:blank').origin is the string
+    // "null" and its pathname is "blank", so this reported "nullblank".
+    if (x.origin === 'null' || x.origin === '') return `${x.protocol}${x.pathname}`;
+    return `${x.origin}${x.pathname}${x.search ? '?…' : ''}`;
+  }
   catch { return '(unparsable url)'; }
 }
 
@@ -1574,7 +1580,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // "whatever is at that position in the whole of Storage" — a different
       // document, downloaded and reported as the one that was asked for.
       const apiOnly = args.folder_id || args.letter_id;
-      const arch = await apiListArchive(args.folder_id, 1000);
+      // The raw archive listing carries no folder field — the very thing
+      // apiArchiveWithFolders exists to fill in — so this reported storedIn as
+      // absent for every document while the tool description promises the
+      // current folder. Scoping to one folder still needs the raw call, and the
+      // membership is grafted back on afterwards.
+      const arch = args.folder_id
+        ? await apiListArchive(args.folder_id, 1000)
+        : await apiArchiveWithFolders(1000);
       if (!arch && apiOnly) {
         return text({ error: 'this needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'folder_id and letter_id cannot be honoured through the portal — drop them to read by position instead' });
       }
@@ -1587,6 +1600,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         // same question with a different meaning of "index" is not a fallback.
         if (!l && apiOnly) {
           return text({ error: 'no such document in Storage', folder_id: args.folder_id ?? null, letter_id: args.letter_id ?? null });
+        }
+        if (l && args.folder_id && l.directoryNames === undefined) {
+          // Scoped listing: we know which folder it came from, because we asked.
+          l.directoryNames = [(await apiListDirectories() || []).find(d => d.directoryId === args.folder_id)?.directoryName].filter(Boolean);
         }
         if (l) {
           let saved = null;

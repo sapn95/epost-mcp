@@ -28,6 +28,7 @@ const letter = (id, over = {}) => ({
 // As long as a real one. A seven-character stand-in slipped under the
 // redactor's minimum length, which is there so that ordinary short words are
 // not mangled — and a test that cannot trip the redactor proves nothing.
+export const API_KEY = 'k-123';
 export const TOKEN = 'tok-abcdefghijklmnopqrstuvwxyz0123456789';
 
 // Read a request body, then hand it over. The mock used to answer before the
@@ -84,7 +85,10 @@ export function start() {
       });
     }
     // everything below needs one of the two documented schemes
-    if (!auth.startsWith('Bearer ') && !key) return send(401, { error: 'unauthorized' });
+    // The exact token, or the exact key. Accepting anything non-empty meant a
+    // server that sent a malformed header — or the wrong credential entirely —
+    // passed the whole suite and failed against ePost.
+    if (auth !== `Bearer ${TOKEN}` && key !== API_KEY) return send(401, { error: 'unauthorized' });
 
     // A gateway that quotes the request it rejected, credentials and all. Real
     // proxies do this, and the body reaches the model through a tool result.
@@ -126,7 +130,10 @@ export function start() {
       // Deleted letters are addressable too — restoring one is the whole point.
       const known = [...state.inbox, ...state.archive, ...state.deleted].find(l => l.id === id);
       if (!known) return send(404, { error: 'not_found' });
-      if (tail === '/content') return send(200, Buffer.from('%PDF-1.4 mock'), 'application/octet-stream');
+      // The id goes in the bytes: identical content for every letter meant a
+      // download that fetched the wrong one was indistinguishable from a
+      // correct one.
+      if (tail === '/content') return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
       // The real eight PNG magic bytes. Written as a string, "\x89" goes out as
       // two UTF-8 bytes and the fixture served something that was not a PNG at
       // all — which a caller checking the signature would rightly reject.
