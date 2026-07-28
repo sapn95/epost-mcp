@@ -198,6 +198,14 @@ describe('archiving', () => {
     assert.match(data.hint, /epost_list_storage_documents/, 'it names the tool that would show it');
   });
 
+  test('two different selectors is a question, not a preference', async () => {
+    // letter_id used to win over index and title in silence, so a call naming
+    // two different letters archived one and reported the request as given.
+    const { data } = await srv.call('epost_store_letter', { letter_id: 'inbox-1', index: 0, folder: 'Example_Alpha' });
+    assert.match(data.error, /pass one of letter_id, index or title/);
+    assert.match(data.error, /letter_id and index/);
+  });
+
   test('marks letters read, and only the ones asked for', async () => {
     // The mock used to answer 204 to anything and change nothing, so this
     // passed on the tool's own echo of its arguments.
@@ -308,5 +316,204 @@ describe('transport selection', () => {
     const { data } = await s.call('epost_settings');
     assert.match(data.api, /no credentials/i);
     s.stop();
+  });
+});
+
+// A letterbox of their own, because these make the service misbehave on purpose
+// and the tests above read one they expect to be intact.
+describe('a token that expires between two calls', () => {
+  let m, s;
+  before(async () => {
+    m = await start();
+    s = await startServer({ EPOST_API_BASE: m.base, EPOST_TRANSPORT: 'api' });
+    await s.call('epost_unread_count');          // authenticate once, as any first call does
+  });
+  after(async () => { s?.stop(); await m?.close(); });
+
+  const tokens = () => m.state.calls.filter(c => c === 'POST /core/latest/token').length;
+
+  test('is fetched again, and the call still answers', async () => {
+    // A token lasts 600 seconds, so it runs out between two tool calls sooner
+    // or later. Reporting that as "the API is unavailable" would send the whole
+    // request to the browser to be done differently — for a session that only
+    // needed renewing.
+    const before = tokens();
+    m.state.forceStatus.push({ status: 401 });
+    const { data, raw } = await s.call('epost_unread_count');
+    assert.equal(data.unread, 2, `the retry did not deliver the answer: ${raw.slice(0, 120)}`);
+    assert.equal(tokens(), before + 1, 'no fresh token was fetched');
+  });
+
+  test('a refusal on the second attempt is reported, not swallowed as unavailability', async () => {
+    // 4xx is the API answering, and answering no. Treating it as "unavailable"
+    // hands the caller a browser fallback for something the service has just
+    // refused — or a fallback result for a request that never went through.
+    m.state.forceStatus.push({ status: 401 }, { status: 400 });
+    const { raw, isError } = await s.call('epost_unread_count');
+    assert.ok(isError, `a refusal came back as a normal answer: ${raw.slice(0, 140)}`);
+    assert.match(raw, /400/, 'it reports the status the service answered with');
+  });
+
+  test('a server error on the second attempt leaves the API unavailable, not refused', async () => {
+    m.state.forceStatus.push({ status: 401 }, { status: 503 });
+    const { data, raw } = await s.call('epost_unread_count');
+    assert.match(data.error || raw, /needs the API/);
+    assert.match(data.hint || raw, /503/, 'the reason is passed on, not replaced');
+  });
+
+  test('a re-authentication that no longer takes is reported as unavailable', async () => {
+    // The 401 provokes a fresh password grant, and that one fails too. There is
+    // no answer to hand back and no session to retry with, so this is the one
+    // case that legitimately reports the API as unavailable.
+    m.state.forceStatus.push({ status: 401 }, { path: '/core/latest/tenants', status: 400 });
+    const { data, raw } = await s.call('epost_unread_count');
+    assert.match(data.error || raw, /needs the API/);
+    assert.match(data.hint || raw, /401/, 'it names the failure it actually hit');
+    // And it recovers: one bad moment must not pin the API down for the life of
+    // the process, which is what an unconditional apiUnavailable used to do.
+    const { data: after } = await s.call('epost_unread_count');
+    assert.equal(after.unread, 2, 'the API stayed "unavailable" after it had recovered');
+  });
+});
+
+describe('addressing a letter by a substring', () => {
+  let m, s;
+  before(async () => {
+    m = await start();
+    // One inbox letter gets a description of its own: with three letters saying
+    // the same thing, no substring can address exactly one, and the difference
+    // between "matches one" and "matches several" is the whole point here.
+    m.state.inbox[1].description = 'Reminder from Example Beta AG';
+    s = await startServer({ EPOST_API_BASE: m.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { s?.stop(); await m?.close(); });
+
+  test('a substring that names one letter archives that one', async () => {
+    const { data, raw } = await s.call('epost_store_letter', { title: 'Example Beta', folder: 'Example_Alpha' });
+    assert.equal(data.transport, 'api', `store failed: ${raw.slice(0, 140)}`);
+    assert.ok(m.state.inFolder['dir-one'].includes('inbox-2'), 'a different letter was filed');
+    assert.ok(!m.state.inbox.some(l => l.id === 'inbox-2'), 'it did not leave the inbox');
+  });
+
+  test('a substring that names two is refused rather than resolved to the first', async () => {
+    // "the first row containing this text" archived, read or deleted a
+    // neighbour just as readily as the intended letter: the descriptions repeat
+    // and so do the dates, so a substring that matches twice is not an address.
+    const { raw, isError } = await s.call('epost_store_letter', { title: 'Someone', folder: 'Example_Alpha' });
+    assert.ok(isError, `it picked one of them: ${raw.slice(0, 140)}`);
+    assert.match(raw, /matches 2 letters/);
+    assert.match(raw, /id or index/, 'and says how to address one properly');
+    assert.equal(m.state.inFolder['dir-one'].length, 2, 'something was filed anyway');
+  });
+});
+
+describe('the API answering no', () => {
+  let m, s, dir;
+  before(async () => {
+    m = await start();
+    dir = mkdtempSync(join(tmpdir(), 'epost-refusal-'));
+    s = await startServer({ EPOST_API_BASE: m.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { s?.stop(); await m?.close(); });
+
+  test('a number is not an output directory', async () => {
+    // mkdirSync takes no descriptors, but it does accept a number and then
+    // fails somewhere far less legible than at the tool boundary.
+    const { raw, isError } = await s.call('epost_download_letter', { index: 0, output_dir: 2 });
+    assert.ok(isError, 'a file descriptor was accepted as a directory');
+    assert.match(raw, /output_dir must be a path, not number/);
+  });
+
+  test('two ways of naming the letter is a question, not a preference', async () => {
+    // letter_id addresses the API's idea of a letter and index addresses a
+    // position in the portal's list. Falling through with both set answered a
+    // different question from the one asked, in silence.
+    const { data } = await s.call('epost_download_letter', { letter_id: 'inbox-1', index: 0, output_dir: dir });
+    assert.match(data.error, /pass either letter_id or index/);
+  });
+
+  test('a thumbnail that is not an image is refused, and nothing is written', async () => {
+    const path = join(dir, 'not-a-thumbnail.png');
+    m.state.thumbnailAsHtml = true;
+    const { data } = await s.call('epost_download_thumbnail', { letter_id: 'inbox-1', output_path: path });
+    m.state.thumbnailAsHtml = false;
+    assert.match(data.error, /did not answer with an image/);
+    assert.ok(!existsSync(path), 'an error page was saved under the name of a thumbnail');
+  });
+
+  test('a document that is not in Storage is reported as missing, not looked for elsewhere', async () => {
+    // The API answered and there is no such document. Asking the browser the
+    // same question, where "index" means something else entirely, is not a
+    // fallback — it is a different question with a plausible-looking answer.
+    const { data } = await s.call('epost_read_storage_document', { letter_id: 'not-a-document' });
+    assert.match(data.error, /no such document in Storage/);
+    assert.equal(data.letter_id, 'not-a-document');
+  });
+
+  test('a document read out of one folder reports that folder', async () => {
+    // The scoped archive listing carries no folder field at all, so this came
+    // back without one while the tool description promises the current folder —
+    // even though the caller had just named it.
+    const { data } = await s.call('epost_read_storage_document', { folder_id: 'dir-one', index: 0 });
+    assert.equal(data.id, 'arch-1');
+    assert.deepEqual(data.storedIn, ['Example_Alpha'], `no folder reported: ${JSON.stringify(data.storedIn)}`);
+  });
+
+  test('a document whose content cannot be fetched is a partial result, not a success', async () => {
+    // Asking for the file and being told "ok" with nothing saved is a wrong
+    // answer about half the request, and nothing downstream can tell.
+    m.state.forceStatus.push({ path: '/epost/v2/letters/arch-1/content', status: 500 });
+    const { data } = await s.call('epost_read_storage_document', { letter_id: 'arch-1', output_dir: dir });
+    assert.equal(data.status, 'partial');
+    assert.equal(data.saved, null);
+    assert.match(data.error, /the file was not saved/);
+    assert.equal(data.id, 'arch-1', 'the metadata half is still reported');
+  });
+
+  test('a letter listing that fails is not read as an empty inbox', async () => {
+    // The folders came back and the letters did not, so the id cannot be
+    // resolved. This used to fall through to the portal, which addresses
+    // letters by position and would happily archive whatever sat there.
+    m.state.forceStatus.push({ path: '/epost/v2/letters', status: 500 });
+    const { data } = await s.call('epost_store_letter', { letter_id: 'inbox-1', folder: 'Example_Alpha' });
+    assert.match(data.error, /letter_id needs the public API/);
+    assert.match(data.note, /index or title/, 'it says what would work instead');
+    assert.ok(!m.state.archive.some(l => l.id === 'inbox-1'), 'something was archived regardless');
+  });
+});
+
+describe('what only the API can answer, when there is no API', () => {
+  let s;
+  before(async () => {
+    // No credentials at all, and a browser path that cannot start either: these
+    // arguments have no meaning in the portal, so the answer must be a refusal
+    // and not an attempt to launch something.
+    s = await startServer({
+      EPOST_API_BASE: mock.base, EPOST_API_PASSWORD: '', EPOST_SWISSID_USER: '', EPOST_API_KEY: '',
+      EPOST_BROWSER: '/definitely/not/a/browser',
+    });
+  });
+  after(() => s?.stop());
+
+  const refused = (raw, what) => {
+    assert.match(raw, /needs the public API and it is unavailable/, `${what}: not refused`);
+    assert.ok(!/EPOST_BROWSER|looked at/.test(raw), `${what}: it tried to launch a browser instead`);
+  };
+
+  test('a letter_id cannot be honoured by the portal', async () => {
+    const { raw } = await s.call('epost_download_letter', { letter_id: 'inbox-1', output_dir: '/tmp' });
+    refused(raw, 'epost_download_letter');
+  });
+
+  test('a folder_id cannot be honoured by the portal', async () => {
+    // The portal lists everything. Falling through with one set answered "all
+    // of Storage" to a question about one folder, and the caller could not tell.
+    const { raw } = await s.call('epost_list_storage_documents', { folder_id: 'dir-one' });
+    refused(raw, 'epost_list_storage_documents');
+  });
+
+  test('reading a Storage document by id cannot be honoured by the portal', async () => {
+    const { raw } = await s.call('epost_read_storage_document', { letter_id: 'arch-1' });
+    refused(raw, 'epost_read_storage_document');
   });
 });
