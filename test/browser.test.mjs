@@ -91,7 +91,12 @@ describe('portal automation', () => {
   });
 
   test('creates a folder', SLOW, async () => {
-    await srv.call('epost_create_folder', { name: 'Neu_Angelegt' });
+    // The reply used to be thrown away, so this stayed green while the tool
+    // reported a refusal — which it now can, and the fixture must therefore
+    // close its dialog like the real portal does on success.
+    const { data } = await srv.call('epost_create_folder', { name: 'Neu_Angelegt' });
+    assert.equal(data.status, 'ok', `creation was not reported as done: ${JSON.stringify(data)}`);
+    assert.equal(data.created, 'Neu_Angelegt');
     assert.ok(portal.state.created.includes('Neu_Angelegt'), 'the portal received the new name');
   });
 

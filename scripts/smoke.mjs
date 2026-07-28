@@ -7,10 +7,11 @@
 //
 // No network, no credentials, no browser — safe to run in CI.
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import readline from 'node:readline';
+import { tmpdir } from 'node:os';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
@@ -19,7 +20,27 @@ const entry = join(root, pkg.main || 'index.js');
 const fail = [];
 const check = (ok, what) => { console.log(`${ok ? 'ok  ' : 'FAIL'}  ${what}`); if (!ok) fail.push(what); };
 
-const child = spawn(process.execPath, [entry], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
+// This gate calls every advertised tool, so it must not be able to reach the
+// real account: it inherited the developer's environment and, through it, the
+// keychain — one `npm run gate` away from listing a real letterbox. A `security`
+// that finds nothing goes first on PATH, the credentials are blanked, the API
+// points at a port nothing listens on, and the transport is pinned so no
+// browser can start either.
+const SANDBOX = mkdtempSync(join(tmpdir(), 'epost-smoke-'));
+writeFileSync(join(SANDBOX, 'security'), '#!/bin/sh\nexit 44\n', { mode: 0o755 });
+const child = spawn(process.execPath, [entry], {
+  stdio: ['pipe', 'pipe', 'pipe'],
+  env: {
+    ...process.env,
+    PATH: `${SANDBOX}:${process.env.PATH}`,
+    EPOST_API_BASE: 'http://127.0.0.1:1',
+    EPOST_API_PASSWORD: '', EPOST_API_KEY: '', EPOST_SWISSID_USER: '',
+    EPOST_TRANSPORT: 'api',
+    EPOST_STATE: join(SANDBOX, 'state.json'),
+    EPOST_PROFILE: join(SANDBOX, 'profile'),
+    EPOST_BROWSER: join(SANDBOX, 'no-browser-here'),
+  },
+});
 let stderr = '';
 child.stderr.on('data', d => { stderr += d.toString(); });
 

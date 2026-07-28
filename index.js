@@ -21,7 +21,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { chromium } from 'playwright';
-import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -138,7 +138,9 @@ async function openContext(wantHeaded) {
   //     drops on close.
   // v0.3.0 replaced the profile with storageState alone, which is why every
   // expiry meant the full two-factor dance again.
-  mkdirSync(PROFILE, { recursive: true });
+  // The profile holds the same session, in Chromium's own store.
+  mkdirSync(PROFILE, { recursive: true, mode: 0o700 });
+  try { chmodSync(PROFILE, 0o700); } catch { /* not ours to tighten */ }
   const launch = () => chromium.launchPersistentContext(PROFILE, {
     headless: !wantHeaded,
     executablePath: findChromium(),
@@ -190,8 +192,13 @@ const namePart = v => String(v ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').replace(/
 async function saveState() {
   if (!ctx) return;
   try {
-    mkdirSync(dirname(STATE), { recursive: true });
+    // A session cookie is password-equivalent: whoever reads this file is
+    // logged in as the account. It was written with the process umask, which on
+    // a normal machine means every local user could read it.
+    mkdirSync(dirname(STATE), { recursive: true, mode: 0o700 });
+    chmodSync(dirname(STATE), 0o700);
     await ctx.storageState({ path: STATE });
+    chmodSync(STATE, 0o600);
   } catch { /* best effort */ }
 }
 
@@ -432,7 +439,10 @@ async function apiArchiveWithFolders(limit = 1000) {
   for (const d of dirs.filter(x => x.directoryId)) {
     const inDir = await apiListArchive(d.directoryId, limit);
     if (inDir === null) { complete = false; continue; }
-    for (const l of (Array.isArray(inDir) ? inDir : (inDir?.letters || []))) {
+    // Same unwrapping as the archive listing above, `content` included: this
+    // one accepted only `letters`, so a service answering with the wrapper the
+    // other branch already handles reported every document as unfiled.
+    for (const l of (Array.isArray(inDir) ? inDir : (inDir?.letters || inDir?.content || []))) {
       folders.set(l.id, [...(folders.get(l.id) || []), d.directoryName]);
     }
   }
@@ -584,6 +594,10 @@ async function goToStorage(p) {
       await p.waitForTimeout(1500);
     }
   }
+  // The loop above gives up quietly after eighteen seconds, and every caller
+  // then read whatever page it was left on — inbox cards reported as Storage
+  // documents, or an empty folder list reported as "no folders".
+  if (!p.url().includes('LetterStorage')) return 'storage_unreachable';
   return 'ok';
 }
 
@@ -613,7 +627,9 @@ async function listStorage(p) {
     }
     const body = clean(document.body.innerText);
     const my = body.match(/My Documents\s*\((\d+)\)/i);
-    return { url: location.href, myDocuments: my ? Number(my[1]) : null, folders };
+    // Origin and path only: the portal carries per-session instance ids in the
+    // query string, and a tool result goes straight into the model's context.
+    return { url: location.origin + location.pathname, myDocuments: my ? Number(my[1]) : null, folders };
   });
   return { status: 'ok', ...data };
 }
@@ -762,13 +778,23 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
     // Re-filing: drop the old membership in the SAME sheet. Doing it alone
     // would leave an empty folder set, which the portal refuses to commit.
     let removed = null;
+    let removeMissing = false;
     if (removeName && removeName !== folderName) {
       const rc = boxFor(removeName);
-      if (rc) removed = toggle(rc, false).click;
+      // A folder the sheet does not offer used to be skipped in silence: the
+      // destination was ticked, the sheet committed, and the tool reported a
+      // move that had only ever added.
+      if (!rc) removeMissing = true;
+      else removed = toggle(rc, false).click;
     }
-    return { ok: true, already: main.on, changed: main.click || !!removed, removed };
+    return { ok: true, already: main.on, changed: main.click || !!removed, removed, removeMissing };
   }, { folderName: folder, add, removeName: remove });
   if (!picked.ok) throw new Error(`folder "${folder}" not offered in the move sheet`);
+  if (picked.removeMissing) {
+    const cancel = p.locator('[id$=":cancel"]').first();
+    if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
+    throw new Error(`remove_from "${remove}" is not offered in the move sheet — nothing was changed`);
+  }
   await p.waitForTimeout(600);
 
   if (!picked.changed) {

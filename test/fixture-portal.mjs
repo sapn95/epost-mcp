@@ -130,7 +130,7 @@ ${sheet()}
          <div id="newfolder" style="display:none">
            <input type="text" id="dlg:folder-name">
            <button id="dlg:create-btn"
-             onclick="fetch('/created?n=' + encodeURIComponent(document.getElementById('dlg:folder-name').value))">Create</button>
+             onclick="fetch('/created?n=' + encodeURIComponent(document.getElementById('dlg:folder-name').value)).then(() => { document.getElementById('newfolder').style.display='none'; })">Create</button>
          </div>
          <h3>Companies (1)</h3><div class="tile"><span>ePost Scancenter</span> <span>3 Files</span></div>
          <h3>Custom (2)</h3>
