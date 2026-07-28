@@ -33,7 +33,9 @@ const PKG = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 
 
 const STATE = process.env.EPOST_STATE || join(homedir(), '.epost-mcp', 'state.json');
 const PROFILE = process.env.EPOST_PROFILE || join(homedir(), '.epost-mcp', 'profile');
-const APP_URL = 'https://app.epost.ch';
+// Overridable so the portal automation can be driven against a local fixture in
+// tests — the selector logic is where every browser bug has been.
+const APP_URL = process.env.EPOST_APP_URL || 'https://app.epost.ch';
 
 // --- browser bootstrap ------------------------------------------------------
 
@@ -149,7 +151,8 @@ async function getContext(wantHeaded = false) {
 
 async function getPage(wantHeaded = false) {
   const c = await getContext(wantHeaded);
-  return c.pages()[0] || await c.newPage();
+  const [existing] = c.pages();
+  return existing ?? c.newPage();
 }
 
 // Persist cookies/localStorage so the session survives a server restart.
@@ -161,23 +164,24 @@ async function saveState() {
   } catch { /* best effort */ }
 }
 
-// --- passkey (WebAuthn virtual authenticator) -------------------------------
+// --- credentials -----------------------------------------------------------
 //
-// A cached storageState only lasts as long as SwissID's session. To re-login
-// WITHOUT a human, we use Chrome's WebAuthn *virtual authenticator* (CDP):
-// a software FIDO2 authenticator whose private key we control. You register it
-// once with SwissID (in a real, headed session), we export the resulting
-// credential and keep it in the macOS keychain; from then on every login is
-// signed automatically — no Touch ID, no SMS code.
+// A note on passkeys, because it looks like the obvious idea and is not: this
+// server used to carry a WebAuthn *virtual authenticator* so it could sign the
+// SwissID login itself, unattended. The mechanism works in general — but
+// SwissID rejects software authenticators outright:
 //
-// SECURITY: a Touch-ID passkey is hardware-bound and cannot be exported. This
-// one is a software key held in the login keychain, so anyone who can read that
-// keychain entry can log into SwissID as you. It is a deliberate trade of
-// phishing-resistance for automation. Use `epost_passkey_forget` to revoke
-// locally, and remove the passkey in the SwissID account settings too.
+//   POST /api-login/authenticate/webauthn-register -> 400
+//   ERROR::WebauthnVendorNotAllowed
+//
+// It was removed rather than kept "just in case". It could never work against
+// the one service this server talks to, it was never exercised, and it wrote an
+// exportable private key into the login keychain — a standing risk in exchange
+// for nothing. A real Touch ID passkey cannot be automated either: a platform
+// authenticator requires genuine user presence, by design. What remains is the
+// assisted login, which drives everything except the fingerprint.
 
-const KC_SERVICE = 'epost-mcp-passkey';
-const DEBUG = !!process.env.EPOST_DEBUG;   // trace the passkey login stations on stderr
+const DEBUG = !!process.env.EPOST_DEBUG;   // trace the login steps on stderr
 
 function keychainRead(service, account = 'epost') {
   try {
@@ -185,205 +189,13 @@ function keychainRead(service, account = 'epost') {
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch { return ''; }
 }
-function keychainWrite(service, value, account = 'epost') {
-  execFileSync('security', ['add-generic-password', '-a', account, '-s', service, '-w', value, '-U'],
-    { stdio: ['ignore', 'ignore', 'ignore'] });
-}
-function keychainDelete(service, account = 'epost') {
-  try {
-    execFileSync('security', ['delete-generic-password', '-a', account, '-s', service],
-      { stdio: ['ignore', 'ignore', 'ignore'] });
-    return true;
-  } catch { return false; }
-}
 
-function loadPasskey() {
-  const raw = keychainRead(KC_SERVICE);
-  if (!raw) return null;
-  try {
-    const c = JSON.parse(raw);
-    return c?.credentialId && c?.privateKey && c?.rpId ? c : null;
-  } catch { return null; }
-}
-
-// Attach virtual authenticators to `p`'s target. `automaticPresenceSimulation`
-// makes them approve user-presence/verification prompts by themselves.
-//
-// We register BOTH transports on purpose. A relying party may ask for a
-// platform authenticator (authenticatorAttachment "platform" → Touch ID-like)
-// or for a roaming security key ("cross-platform" → USB). An authenticator
-// whose transport does not match the request is simply not eligible, and Chrome
-// then sits on its "Insert your security key and touch it" dialog forever —
-// which is exactly what SwissID's register-passkey page triggers. Offering an
-// `internal` and a `usb` authenticator satisfies either path.
-const AUTH_BASE = {
-  protocol: 'ctap2',
-  ctap2Version: 'ctap2_1',
-  hasResidentKey: true,          // discoverable credential → usernameless login
-  hasUserVerification: true,
-  isUserVerified: true,
-  automaticPresenceSimulation: true,
-  defaultBackupEligibility: true,
-  defaultBackupState: true,
-};
-
-async function attachAuthenticator(p) {
-  const cdp = await ctx.newCDPSession(p);
-  await cdp.send('WebAuthn.enable', { enableUI: false });
-  const ids = [];
-  for (const transport of ['internal', 'usb']) {
-    const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
-      options: { ...AUTH_BASE, transport },
-    });
-    ids.push({ authenticatorId, transport });
-  }
-  return { cdp, ids, authenticatorId: ids[0].authenticatorId };
-}
-
-// First credential found across every attached authenticator.
-async function findCredential(cdp, ids) {
-  for (const { authenticatorId, transport } of ids) {
-    const { credentials } = await cdp.send('WebAuthn.getCredentials', { authenticatorId }).catch(() => ({ credentials: [] }));
-    const c = (credentials || []).find(x => x.privateKey);
-    if (c) return { ...c, transport, authenticatorId };
-  }
-  return null;
-}
-
-// Load the stored credential into a fresh virtual authenticator so the next
-// WebAuthn assertion on the login page can be signed without a human.
-async function armPasskey(p) {
-  const cred = loadPasskey();
-  if (!cred) return null;
-  const { cdp, ids } = await attachAuthenticator(p);
-  // Load the key into every attached authenticator, so the assertion succeeds
-  // whichever attachment the login page asks for.
-  for (const { authenticatorId } of ids) {
-    await cdp.send('WebAuthn.addCredential', {
-      authenticatorId,
-      credential: {
-        credentialId: cred.credentialId,
-        isResidentCredential: true,
-        rpId: cred.rpId,
-        privateKey: cred.privateKey,
-        userHandle: cred.userHandle || undefined,
-        signCount: cred.signCount || 0,
-      },
-    }).catch(() => {});
-  }
-  return { cdp, ids, cred };
-}
-
-// Click whatever offers a passkey login on the current SwissID screen.
-async function clickPasskeyAffordance(p) {
-  const patterns = [/passkey/i, /pass-key/i, /sicherheitsschl(ü|u)ssel/i, /security key/i, /biometri/i, /fido/i];
-  for (const re of patterns) {
-    for (const loc of [p.getByRole('button', { name: re }), p.getByRole('link', { name: re }), p.getByText(re)]) {
-      const n = await loc.count().catch(() => 0);
-      for (let i = 0; i < n; i++) {
-        const el = loc.nth(i);
-        if (await el.isVisible().catch(() => false)) {
-          await el.click({ timeout: 6000 }).catch(() => {});
-          return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-// Full non-interactive re-login. Returns 'ok' | 'login_required' | 'no_passkey'.
-//
-// The route from an expired session to the letterbox has four stations, and the
-// passkey only becomes available at the last one:
-//   app.epost.ch
-//     → login.epost.ch (Keycloak)          click "Login mit SwissID"
-//     → login.swissid.ch/login/login-email  enter the account e-mail, "Weiter"
-//     → login.swissid.ch/login/login-password  click "Mit Passkey anmelden"
-//     → back to app.epost.ch, authenticated
-// Each step is driven only when its own URL is showing, so the loop simply
-// re-checks where it is; a step that is skipped by the server does no harm.
-async function passkeyLogin(p) {
-  const armed = await armPasskey(p);
-  if (!armed) return 'no_passkey';
-  const user = process.env.EPOST_SWISSID_USER || armed.cred.username || '';
-  let didSwissId = false, didEmail = false, didPasskey = false;
-  try {
-    await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    let lastSeen = '';
-    for (let i = 0; i < 40; i++) {
-      await p.waitForTimeout(2000);
-      const u = p.url();
-      if (DEBUG && u !== lastSeen) { console.error('[passkey]', i, u); lastSeen = u; }
-
-      // Arrived: an authenticated ePost surface.
-      if (/app\.epost\.ch/.test(u) && !/oauth_login|openid-connect/.test(u)) {
-        if (u.includes('DigitalLetterboxOverview')
-          || await p.locator('div.letter-wrapper').count().catch(() => 0)
-          || await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0)) {
-          // Persist the bumped signature counter so the RP's replay check passes.
-          await syncSignCount(armed).catch(() => {});
-          return await ensureLetterbox(p);
-        }
-      }
-
-      // Station 1 — ePost's own Keycloak page: hand over to SwissID.
-      if (/login\.epost\.ch/.test(u) && !didSwissId) {
-        const sw = p.getByRole('button', { name: /Login mit SwissID/i }).first();
-        if (await sw.count().catch(() => 0)) {
-          await sw.click({ timeout: 8000 }).catch(() => {});
-          didSwissId = true;
-          if (DEBUG) console.error('[passkey] clicked: Login mit SwissID');
-        }
-        continue;
-      }
-
-      // Station 2 — SwissID asks which account.
-      if (/login-email/.test(u) && !didEmail) {
-        if (!user) return 'login_required';  // nothing to type; a human is needed
-        const inp = p.locator('input[type=text], input[type=email]').first();
-        if (await inp.count().catch(() => 0)) {
-          await inp.fill(user, { timeout: 8000 }).catch(() => {});
-          const next = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
-          if (await next.count().catch(() => 0)) await next.click({ timeout: 8000 }).catch(() => {});
-          didEmail = true;
-          if (DEBUG) console.error('[passkey] filled e-mail + Weiter');
-        }
-        continue;
-      }
-
-      // Station 3 — password screen, which also offers the passkey. This is
-      // where the virtual authenticator signs, with no user interaction.
-      if (/login-password/.test(u) && !didPasskey) {
-        const pk = p.getByRole('button', { name: /Mit Passkey anmelden|Sign in with (a )?passkey/i }).first();
-        if (await pk.count().catch(() => 0)) {
-          await pk.click({ timeout: 8000 }).catch(() => {});
-          didPasskey = true;
-          if (DEBUG) console.error('[passkey] clicked: Mit Passkey anmelden');
-        } else {
-          await clickPasskeyAffordance(p);
-        }
-        continue;
-      }
-    }
-    return 'login_required';
-  } finally {
-    await armed.cdp.detach().catch(() => {});
-  }
-}
-
-// Keep the stored signCount in step with the authenticator's, so the relying
-// party does not reject the next assertion as a clone/replay.
-async function syncSignCount(armed) {
-  let best = armed.cred.signCount || 0;
-  for (const { authenticatorId } of armed.ids) {
-    const { credentials } = await armed.cdp.send('WebAuthn.getCredentials', { authenticatorId }).catch(() => ({ credentials: [] }));
-    const live = (credentials || []).find(c => c.credentialId === armed.cred.credentialId);
-    if (live && (live.signCount || 0) > best) best = live.signCount;
-  }
-  keychainWrite(KC_SERVICE, JSON.stringify({ ...armed.cred, signCount: best }));
-}
-
+// An environment variable that is SET, even to the empty string, is the answer.
+// Falling through to the keychain on an empty value makes it impossible to say
+// "no credential" — and let a test that tried to isolate itself silently pick
+// up the real account.
+const envOrKeychain = (name, service) =>
+  (process.env[name] !== undefined ? process.env[name] : keychainRead(service)) || '';
 
 // --- public API (preferred transport) ---------------------------------------
 //
@@ -421,13 +233,13 @@ let apiUnavailable = null;    // why the API cannot be used, once known
 
 function apiKey() {
   if (TRANSPORT === 'browser') return '';
-  return process.env.EPOST_API_KEY || keychainRead(KC_API_KEY) || '';
+  return envOrKeychain('EPOST_API_KEY', KC_API_KEY);
 }
 
 function apiCredentials() {
   if (TRANSPORT === 'browser') return null;      // pinned to the browser
   const user = swissIdUser();
-  const password = process.env.EPOST_API_PASSWORD || keychainRead(KC_API_PASSWORD);
+  const password = envOrKeychain('EPOST_API_PASSWORD', KC_API_PASSWORD);
   return user && password ? { user, password } : null;
 }
 
@@ -500,17 +312,35 @@ async function apiAuth() {
 
 // Run `fn` against the API; return null if the API cannot serve it, so the
 // caller falls back to the browser instead of failing.
+// Run `fn` against the API. Returns null when the API cannot serve the call at
+// all, so the caller falls back to the browser.
+//
+// A 4xx is NOT that case: it is the API answering, and answering no. Treating
+// "already archived" or "not found" as "unavailable" would silently retry the
+// operation through the browser, where it may do something subtly different, or
+// hand the caller a fallback result for a request the service rejected. Those
+// are rethrown so the tool can report them. The exceptions are 401 (retry once
+// with a fresh token) and 404, which can legitimately mean "not here".
 async function withApi(fn) {
   const auth = await apiAuth();
   if (!auth) return null;
-  const token = auth === 'api-key' ? null : auth;   // key travels in the header
+  const bearer = () => (apiToken ? apiToken.value : null);   // null when the key alone authenticates
   try {
-    return await fn(token);
+    return await fn(bearer());
   } catch (e) {
-    if (e.status === 401) { apiToken = null; }   // expired mid-call: retry once
-    if (e.status === 401 && await apiAuth()) {
-      try { return await fn(apiToken.value); } catch (e2) { apiUnavailable = e2.message; return null; }
+    if (e.status === 401) {
+      apiToken = null;
+      if (await apiAuth()) {
+        try { return await fn(bearer()); } catch (e2) {
+          apiUnavailable = e2.message;
+          if (DEBUG) console.error('[api] retry failed:', e2.message);
+          return null;
+        }
+      }
+      apiUnavailable = e.message;
+      return null;
     }
+    if (e.status >= 400 && e.status < 500 && e.status !== 404) throw e;
     apiUnavailable = e.message;
     if (DEBUG) console.error('[api] call failed:', e.message);
     return null;
@@ -530,7 +360,8 @@ function apiLetterRow(l, i) {
     receivedDateTime: l.receivedDateTime || null,
     fileName: l.fileName || null,
     read: l.readStatus === 'READ',
-    storedIn: l.directoryNames || l.directoryName || undefined,
+    // null = in no folder; undefined = membership was not looked up
+    storedIn: l.directoryNames ?? l.directoryName ?? undefined,
   };
 }
 
@@ -543,6 +374,26 @@ const apiListDirectories = () => withApi(t => apiFetch('GET', '/epost/v2/archive
 const apiListArchive = (directoryId, limit = 1000) => withApi(t => apiFetch('GET', '/epost/v2/archives/letters', {
   token: t, params: { limit, 'directory-id': directoryId || undefined },
 }));
+
+// The archive listing carries NO folder field, so a document read from it looks
+// unfiled even when it is not — which would have a caller re-file the whole
+// archive. Membership has to be derived by asking each folder what it holds.
+// One call per folder, and there are few of them.
+async function apiArchiveWithFolders(limit = 1000) {
+  const all = await apiListArchive(undefined, limit);
+  if (!all) return null;
+  const items = Array.isArray(all) ? all : (all.letters || all.content || []);
+  const dirs = await apiListDirectories();
+  if (!dirs) return items;
+  const folders = new Map();
+  for (const d of dirs.filter(x => x.directoryId)) {
+    const inDir = await apiListArchive(d.directoryId, limit);
+    for (const l of (Array.isArray(inDir) ? inDir : (inDir?.letters || []))) {
+      folders.set(l.id, [...(folders.get(l.id) || []), d.directoryName]);
+    }
+  }
+  return items.map(l => ({ ...l, directoryNames: folders.get(l.id) || null }));
+}
 
 const apiLetterContent = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}/content`, { token: t, raw: true }));
 
@@ -789,7 +640,7 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
 
   // Resolve the target document card (Storage documents are div.letter-wrapper).
   const cards = p.locator('div.letter-wrapper');
-  let card = null;
+  let card;
   if (typeof index === 'number') {
     if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} loaded documents)`);
     card = cards.nth(index);
@@ -880,7 +731,7 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
 
 // The SwissID account e-mail, used to skip the "which account?" step.
 function swissIdUser() {
-  return process.env.EPOST_SWISSID_USER || keychainRead('epost-mcp-swissid-user') || '';
+  return envOrKeychain('EPOST_SWISSID_USER', 'epost-mcp-swissid-user');
 }
 
 // Assisted login: drive every step of the SwissID chain that does NOT need a
@@ -921,7 +772,7 @@ async function assistedLogin(p, waitMs = 300000) {
       && (u.includes('DigitalLetterboxOverview')
         || await p.locator('div.letter-wrapper').count().catch(() => 0)
         || await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0))) {
-      return await ensureLetterbox(p);
+      return ensureLetterbox(p);
     }
     if (/login\.epost\.ch/.test(u) && await once('swissid', async () => {
       const b = p.getByRole('button', { name: /Login mit SwissID/i }).first();
@@ -952,80 +803,11 @@ async function assistedLogin(p, waitMs = 300000) {
   return 'login_required';
 }
 
-// Did the relying party accept the freshly created credential? Returns
-// 'accepted' | 'rejected' | 'unknown'. The registration page navigates to
-// .../register-passkey-error when the server says no.
-async function waitForRegistrationVerdict(p, ms = 45000) {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    const u = p.url();
-    if (/register-passkey-error|error/i.test(u)) return 'rejected';
-    if (!/register-passkey/i.test(u)) return 'accepted';   // moved on = stored
-    if (await p.getByText(/nicht geklappt|fehlgeschlagen|failed|error/i).count().catch(() => 0)) return 'rejected';
-    await p.waitForTimeout(1500);
-  }
-  return 'unknown';
-}
-
-// One-time interactive enrolment: opens a headed window with a virtual
-// authenticator already attached, waits while YOU add a passkey in the SwissID
-// security settings, then exports the created credential to the keychain.
-//
-// NOTE: against SwissID this cannot succeed — see waitForRegistrationVerdict.
-// The tools are kept because the mechanism is sound for relying parties that
-// accept software authenticators; SwissID is not one of them.
-async function passkeyRegister(p, waitMs = 480000) {
-  const { cdp, ids } = await attachAuthenticator(p);
-  try {
-    await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await p.bringToFront().catch(() => {});
-    const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline) {
-      const c = await findCredential(cdp, ids);
-      if (c?.credentialId && c?.privateKey) {
-        // A key in the authenticator only means the KEY was made. The relying
-        // party still has to accept the attestation and store it on the account,
-        // and SwissID rejects software authenticators outright:
-        //   POST /api-login/authenticate/webauthn-register -> HTTP 400
-        //   -> /login/register-passkey-error
-        // Never report success on the local key alone — wait for the verdict.
-        const verdict = await waitForRegistrationVerdict(p);
-        if (verdict !== 'accepted') {
-          return {
-            status: 'rejected',
-            message: 'The key was created locally but the identity provider refused to register it '
-              + '(SwissID requires attested hardware authenticators). Nothing was stored.',
-            page: p.url(),
-          };
-        }
-        keychainWrite(KC_SERVICE, JSON.stringify({
-          credentialId: c.credentialId,
-          rpId: c.rpId,
-          privateKey: c.privateKey,
-          userHandle: c.userHandle || '',
-          signCount: c.signCount || 0,
-        }));
-        await saveState();
-        return { status: 'ok', rpId: c.rpId, transport: c.transport, stored_in: `macOS keychain (${KC_SERVICE})` };
-      }
-      await p.waitForTimeout(2500);
-    }
-    // No passkey appeared, but the window may still have been used to log in —
-    // keep that session rather than throwing the manual login away.
-    await saveState();
-    return { status: 'timeout', message: 'No passkey was created in the open window; any session established there was cached.' };
-  } finally {
-    await cdp.detach().catch(() => {});
-  }
-}
-
-// Letterbox access that heals an expired session by itself when a passkey is
-// enrolled: try normally, and on login_required re-authenticate and retry once.
-async function ensureSession(p) {
-  let st = await ensureLetterbox(p);
-  if (st === 'ok' || !loadPasskey()) return st;
-  st = await passkeyLogin(p);
-  return st === 'no_passkey' ? 'login_required' : st;
+// Letterbox access. An expired session cannot be healed without a human — see
+// the note on passkeys above — so this reports login_required and the caller
+// runs epost_login, which drives everything except the fingerprint.
+function ensureSession(p) {
+  return ensureLetterbox(p);
 }
 
 
@@ -1044,7 +826,7 @@ async function storeLetter(p, { index, title, folder }) {
   await p.waitForTimeout(2500);
   const cards = p.locator('div.letter-wrapper');
   await cards.first().waitFor({ state: 'visible', timeout: 20000 }).catch(() => {});
-  let card = null;
+  let card;
   if (typeof index === 'number') {
     if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} letters)`);
     card = cards.nth(index);
@@ -1131,7 +913,7 @@ async function readStorageDocument(p, { index, title, outputDir }) {
   await loadAllCards(p);
 
   const cards = p.locator('div.letter-wrapper');
-  let card = null;
+  let card;
   if (typeof index === 'number') {
     if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} documents)`);
     card = cards.nth(index);
@@ -1198,9 +980,6 @@ const TOOLS = [
   { name: 'epost_status', description: 'Check whether the ePost session is alive (ok) or an interactive SwissID login is needed (login_required).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_login', description: 'Open a VISIBLE browser window and drive the whole SwissID login except the biometric prompt: it goes to SwissID, fills the account e-mail and requests the passkey, so you only confirm with Touch ID. Falls back to a normal manual login. Caches the session afterwards.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 300)' } } } },
   { name: 'epost_settings', description: 'Show the resolved configuration: which browser is driven and why, whether it can use Touch ID passkeys, the profile/state paths, and whether the SwissID account e-mail is configured.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_passkey_status', description: 'Report whether a software passkey is enrolled for hands-free SwissID re-login.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'epost_passkey_register', description: 'ONE-TIME: open a visible window with a virtual FIDO2 authenticator attached; add a passkey in your SwissID security settings and the credential is exported to the macOS keychain. Afterwards expired sessions re-login automatically, with no Touch ID or SMS code. SECURITY: this key is software-held and exportable — it trades phishing-resistance for automation.', inputSchema: { type: 'object', properties: { wait_seconds: { type: 'number', description: 'how long to keep the window open (default 480)' } } } },
-  { name: 'epost_passkey_forget', description: 'Delete the locally stored passkey from the macOS keychain (also remove it in the SwissID account settings to fully revoke).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, sender, title, dates, preview).', inputSchema: { type: 'object', properties: {} } },
   { name: 'epost_download_letter', description: 'Download one letter by list index to output_dir. Returns the saved path (YYYY-MM-DD_ePost_<index>.pdf).', inputSchema: { type: 'object', properties: { index: { type: 'number' }, output_dir: { type: 'string' } }, required: ['index', 'output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
@@ -1222,7 +1001,7 @@ const TOOLS = [
 ];
 
 const server = new Server({ name: PKG.name, version: PKG.version }, { capabilities: { tools: {} } });
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async req => {
   const { name, arguments: args = {} } = req.params;
@@ -1232,22 +1011,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       const p = await getPage();
       const status = await ensureSession(p);
       await saveState();
-      return text({ status, passkey: loadPasskey() ? 'enrolled' : 'none' });
-    }
-    if (name === 'epost_passkey_status') {
-      const c = loadPasskey();
-      return text(c
-        ? { passkey: 'enrolled', rpId: c.rpId, signCount: c.signCount, stored_in: `macOS keychain (${KC_SERVICE})` }
-        : { passkey: 'none', hint: 'Run epost_passkey_register once to enable hands-free re-login.' });
-    }
-    if (name === 'epost_passkey_register') {
-      const p = await getPage(true);
-      const out = await passkeyRegister(p, Math.max(30, Number(args.wait_seconds) || 480) * 1000);
-      return text(out);
-    }
-    if (name === 'epost_passkey_forget') {
-      const removed = keychainDelete(KC_SERVICE);
-      return text({ removed, note: 'Also delete the passkey in your SwissID account settings to fully revoke it.' });
+      return text({ status });
     }
     if (name === 'epost_login') {
       const p = await getPage(true);
@@ -1265,41 +1029,45 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       });
     }
     if (name === 'epost_settings') {
-      const p = await getPage();
-      const uvpaa = await p.evaluate(() =>
-        PublicKeyCredential?.isUserVerifyingPlatformAuthenticatorAvailable?.().catch(() => false)).catch(() => 'unknown');
+      // Deliberately side-effect free: reporting configuration must not start a
+      // browser. It used to probe the platform authenticator by opening a page,
+      // which made a read-only question cost a browser launch — and hung
+      // wherever a browser is unavailable.
       const user = swissIdUser();
-      // The probe usually runs in the headless context, which has no biometric
-      // UI and so always answers false. That says nothing about the headed
-      // window epost_login opens, which is where Touch ID actually happens —
-      // reporting the raw false here would be plain wrong.
-      const signedBrowser = browserChoice.key && browserChoice.key !== 'chromium';
-      const touchId = uvpaa === true ? 'available'
-        : headed ? 'NOT available in this browser — login falls back to password + SMS'
-          : signedBrowser
-            ? `not probeable headless; expected to work in the headed login window (${browserChoice.key} is signed)`
-            : 'NOT available — the bundled Chromium cannot reach the platform authenticator; set EPOST_BROWSER=chrome';
+      const signed = browserChoice.key && browserChoice.key !== 'chromium';
       return text({
-        transport: TRANSPORT === 'auto' ? (apiCredentials() ? 'auto (API preferred)' : 'auto (browser — no API password set)') : TRANSPORT,
+        transport: TRANSPORT,
         api: apiUnavailable ? `unavailable: ${apiUnavailable}`
-          : [apiCredentials() && 'password grant', apiKey() && 'X-API-KEY'].filter(Boolean).join(' + ') || 'no credentials configured',
-        browser: { key: browserChoice.key, path: browserChoice.path, chosen_because: browserChoice.reason },
-        touch_id_passkeys: touchId,
-        swissid_user: user ? user.replace(/^(.).*(@.*)$/, '$1***$2') : 'not set — epost_login cannot skip the e-mail step',
+          : [apiCredentials() && 'password grant', apiKey() && 'X-API-KEY'].filter(Boolean).join(' + ')
+            || 'no credentials configured',
+        browser: {
+          key: browserChoice.key || '(none launched yet)',
+          path: browserChoice.path,
+          chosen_because: browserChoice.reason || 'not resolved yet',
+        },
+        touch_id_passkeys: browserChoice.key
+          ? (signed ? 'expected to work (signed system browser)'
+            : 'NOT available — the bundled Chromium cannot reach the platform authenticator; set EPOST_BROWSER=chrome')
+          : 'unknown until a browser is launched',
+        swissid_user: user ? user.replace(/^(.).*(@.*)$/, '$1***$2')
+          : 'not set — epost_login cannot skip the e-mail step',
         paths: { state: STATE, profile: PROFILE },
         settings: {
+          EPOST_TRANSPORT: 'auto | api | browser',
           EPOST_BROWSER: 'chrome | chrome-canary | edge | brave | chromium | /absolute/path',
-          EPOST_SWISSID_USER: 'account e-mail (or macOS keychain item "epost-mcp-swissid-user")',
-          EPOST_STATE: 'cached session file',
-          EPOST_PROFILE: 'persistent browser profile',
-          EPOST_TRANSPORT: 'auto (default) | api | browser',
           EPOST_API_PASSWORD: 'API password (or keychain item "epost-mcp-api-password")',
           EPOST_API_KEY: 'X-API-KEY (or keychain item "epost-mcp-api-key")',
+          EPOST_SWISSID_USER: 'account e-mail (or keychain item "epost-mcp-swissid-user")',
+          EPOST_APP_URL: 'portal base, for tests',
+          EPOST_STATE: 'cached session file',
+          EPOST_PROFILE: 'persistent browser profile',
           EPOST_DEBUG: '1 to trace the login steps on stderr',
         },
       });
     }
-
+    // The page the browser-backed tools work on. Resolved here rather than at
+    // the top of the dispatcher so that API-only calls — and epost_settings —
+    // never pay for a browser launch.
     const p = await getPage();
 
     if (name === 'epost_list_letters') {
@@ -1432,7 +1200,9 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       return text(out);
     }
     if (name === 'epost_list_storage_documents') {
-      const viaApi = await apiListArchive(args.folder_id, args.limit || 1000);
+      const viaApi = args.folder_id
+        ? await apiListArchive(args.folder_id, args.limit || 1000)
+        : await apiArchiveWithFolders(args.limit || 1000);
       if (viaApi) {
         const items = Array.isArray(viaApi) ? viaApi : (viaApi.letters || viaApi.content || []);
         return text({ transport: 'api', count: items.length, documents: items.map(apiLetterRow) });
@@ -1493,6 +1263,22 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     return { content: [{ type: 'text', text: 'ERROR: ' + (e.message || String(e)) }], isError: true };
   }
 });
+
+// Close the browser when the server is told to stop. Without this a killed
+// server leaves an orphaned Chrome holding the profile's SingletonLock, and the
+// next start fails with "Failed to create a ProcessSingleton for your profile
+// directory" — which reads like a corrupt profile and is really just a process
+// nobody reaped. The self-heal in getContext exists because of that; this stops
+// it happening in the first place.
+let closing = false;
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, async () => {
+    if (closing) return;
+    closing = true;
+    try { await ctx?.close(); } catch { /* going away regardless */ }
+    process.exit(0);
+  });
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -4,3 +4,5 @@ state.json
 *.log
 .DS_Store
 _discover.mjs
+coverage/
+.nyc_output/

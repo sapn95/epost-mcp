@@ -1,0 +1,196 @@
+import { test, before, after, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { start } from './mock-epost.mjs';
+import { startServer } from './client.mjs';
+
+let mock, srv, out;
+
+before(async () => {
+  mock = await start();
+  out = mkdtempSync(join(tmpdir(), 'epost-test-'));
+  srv = await startServer({ EPOST_API_BASE: mock.base, EPOST_TRANSPORT: 'api' });
+});
+after(async () => { srv?.stop(); await mock?.close(); });
+
+describe('protocol', () => {
+  test('advertises itself with the package version', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    assert.equal(srv.init.result.serverInfo.name, pkg.name);
+    assert.equal(srv.init.result.serverInfo.version, pkg.version);
+  });
+
+  test('every tool has a usable description and an object schema', async () => {
+    const tools = await srv.tools();
+    assert.ok(tools.length >= 20, `expected the full tool set, got ${tools.length}`);
+    for (const t of tools) {
+      assert.ok(t.description.length > 20, `${t.name}: description too thin`);
+      assert.equal(t.inputSchema.type, 'object', `${t.name}: schema is not an object`);
+      for (const r of t.inputSchema.required || []) {
+        assert.ok(Object.hasOwn(t.inputSchema.properties, r), `${t.name}: required "${r}" undeclared`);
+      }
+    }
+  });
+});
+
+describe('authentication', () => {
+  test('obtains a token and reports the API as the transport', async () => {
+    const { data } = await srv.call('epost_list_letters');
+    assert.equal(data.transport, 'api');
+    assert.ok(mock.state.calls.includes('POST /core/latest/tenants'));
+    assert.ok(mock.state.calls.includes('POST /core/latest/token'));
+  });
+
+  test('an API key alone authenticates, without the password grant', async () => {
+    const s = await startServer({
+      EPOST_API_BASE: mock.base, EPOST_TRANSPORT: 'api',
+      EPOST_API_PASSWORD: '', EPOST_SWISSID_USER: '', EPOST_API_KEY: 'k-123',
+    });
+    const { data } = await s.call('epost_list_letters');
+    assert.equal(data.transport, 'api', 'the key alone should be enough');
+    s.stop();
+  });
+
+  test('settings report which schemes are configured', async () => {
+    const { data } = await srv.call('epost_settings');
+    assert.match(data.api, /password grant/);
+    assert.equal(data.transport, 'api');
+  });
+});
+
+describe('reading', () => {
+  test('lists inbox letters with the real description, not the uniform title', async () => {
+    const { data } = await srv.call('epost_list_letters');
+    assert.equal(data.count, 2);
+    assert.equal(data.letters[0].sender, 'Invoice from Someone AG');
+    assert.deepEqual(data.letters[0].documentTypes, ['Invoice']);
+    assert.equal(data.letters[0].date, '02.02.2020', 'date is rendered dd.mm.yyyy like the portal');
+  });
+
+  test('lists Storage folders with ids, separating branded ones', async () => {
+    const { data } = await srv.call('epost_list_storage');
+    assert.equal(data.folders.length, 2);
+    assert.equal(data.companyFolders.length, 1);
+    assert.ok(data.folders.every(f => f.id));
+  });
+
+  test('Storage documents carry folder membership, which the raw API omits', async () => {
+    const { data } = await srv.call('epost_list_storage_documents');
+    assert.equal(data.count, 3);
+    const filed = data.documents.filter(d => d.storedIn?.length);
+    assert.equal(filed.length, 2, 'two of three are in a folder');
+    const unfiled = data.documents.find(d => !d.storedIn?.length);
+    assert.equal(unfiled.id, 'arch-2', 'the unfiled one must be identifiable as unfiled');
+  });
+
+  test('gets one letter by id', async () => {
+    const { data } = await srv.call('epost_get_letter', { letter_id: 'inbox-1' });
+    assert.equal(data.id, 'inbox-1');
+  });
+
+  test('counts unread', async () => {
+    const { data } = await srv.call('epost_unread_count');
+    assert.equal(data.unread, 1);
+  });
+
+  test('searches inside letter content', async () => {
+    const { data } = await srv.call('epost_search', { keyword: 'Someone' });
+    assert.ok(data.count >= 1);
+  });
+
+  test('lists the trash', async () => {
+    const { data } = await srv.call('epost_list_deleted');
+    assert.equal(data.count, 1);
+  });
+});
+
+describe('downloads', () => {
+  test('saves a letter as a real file', async () => {
+    const { data } = await srv.call('epost_download_letter', { index: 0, output_dir: out });
+    assert.ok(existsSync(data.saved), 'file written');
+    assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'looks like a PDF');
+  });
+
+  test('saves a thumbnail', async () => {
+    const p = join(out, 'thumb.png');
+    const { data } = await srv.call('epost_download_thumbnail', { letter_id: 'inbox-1', output_path: p });
+    assert.equal(data.saved, p);
+    assert.ok(existsSync(p));
+  });
+
+  test('reads an archived document and can save it', async () => {
+    const { data } = await srv.call('epost_read_storage_document', { index: 0, output_dir: out });
+    assert.equal(data.transport, 'api');
+    assert.ok(existsSync(data.saved));
+  });
+});
+
+describe('archiving', () => {
+  test('files an inbox letter into a folder, matching the name NFC-insensitively', async () => {
+    // The mock returns the folder name NFD-normalised, as the service does.
+    const { data } = await srv.call('epost_store_letter', { letter_id: 'inbox-2', folder: 'Example_Ümlaut' });
+    assert.equal(data.transport, 'api');
+    assert.ok(mock.state.inFolder['dir-two'].includes('inbox-2'));
+  });
+
+  test('names the folders it does know when asked for one it does not', async () => {
+    const { data } = await srv.call('epost_store_letter', { letter_id: 'inbox-1', folder: 'Nope' });
+    assert.match(data.error, /not found/);
+    assert.ok(Array.isArray(data.available) && data.available.length, 'lists what is available');
+  });
+
+  test('marks letters read', async () => {
+    const { data } = await srv.call('epost_set_read_status', { letter_ids: ['inbox-1'], status: 'READ' });
+    assert.equal(data.updated, 1);
+  });
+
+  test('restores a deleted letter', async () => {
+    const { data } = await srv.call('epost_restore_letter', { letter_id: 'inbox-1' });
+    assert.equal(data.restored, 'inbox-1');
+  });
+});
+
+describe('safety', () => {
+  test('refuses to delete without explicit confirmation', async () => {
+    const { data } = await srv.call('epost_delete_letter', { letter_id: 'inbox-1', confirm: false });
+    assert.match(data.refused, /confirm/);
+    assert.ok(!mock.state.calls.some(c => c.startsWith('DELETE ')), 'nothing was deleted');
+  });
+
+  test('deletes only when confirmed, and says it is recoverable', async () => {
+    const { data } = await srv.call('epost_delete_letter', { letter_id: 'inbox-1', confirm: true });
+    assert.equal(data.deleted, 'inbox-1');
+    assert.match(data.note, /restore/i);
+  });
+
+  test('never echoes the password or the token', async () => {
+    const { data } = await srv.call('epost_settings');
+    const blob = JSON.stringify(data) + srv.stderr();
+    assert.ok(!blob.includes('test-password'), 'password must not surface');
+    assert.ok(!blob.includes('tok-abc'), 'token must not surface');
+    assert.match(data.swissid_user, /\*\*\*/, 'the account is masked');
+  });
+});
+
+describe('transport selection', () => {
+  test('pinned to browser, the API is not consulted at all', async () => {
+    const before = mock.state.calls.length;
+    const s = await startServer({ EPOST_API_BASE: mock.base, EPOST_TRANSPORT: 'browser', EPOST_BROWSER: '/nonexistent' });
+    const { data } = await s.call('epost_settings');
+    assert.equal(data.transport, 'browser');
+    assert.equal(mock.state.calls.length, before, 'no API traffic when pinned to the browser');
+    s.stop();
+  });
+
+  test('with no credentials the API is reported unavailable rather than pretended', async () => {
+    const s = await startServer({
+      EPOST_API_BASE: mock.base, EPOST_API_PASSWORD: '', EPOST_SWISSID_USER: '', EPOST_API_KEY: '',
+      EPOST_BROWSER: '/nonexistent',
+    });
+    const { data } = await s.call('epost_settings');
+    assert.match(data.api, /no credentials/i);
+    s.stop();
+  });
+});
