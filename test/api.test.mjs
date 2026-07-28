@@ -185,9 +185,15 @@ describe('archiving', () => {
     assert.match(data.hint, /epost_list_storage_documents/, 'it names the tool that would show it');
   });
 
-  test('marks letters read', async () => {
+  test('marks letters read, and only the ones asked for', async () => {
+    // The mock used to answer 204 to anything and change nothing, so this
+    // passed on the tool's own echo of its arguments.
+    const other = mock.state.inbox.find(l => l.id !== 'inbox-1');
+    const before = other.readStatus;
     const { data } = await srv.call('epost_set_read_status', { letter_ids: ['inbox-1'], status: 'READ' });
     assert.equal(data.updated, 1);
+    assert.equal(mock.state.inbox.find(l => l.id === 'inbox-1').readStatus, 'READ', 'the letter did not change');
+    assert.equal(other.readStatus, before, 'a letter nobody named changed too');
   });
 
   test('restores a deleted letter, and the trash gives it up', async () => {

@@ -138,9 +138,15 @@ describe('portal automation', () => {
   test('downloads every letter in one go', SLOW, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'epost-all-'));
     const { data, raw } = await srv.call('epost_download_all', { output_dir: dir });
-    assert.ok(data.count >= 1, `nothing downloaded: ${raw.slice(0, 120)}`);
-    assert.equal(data.saved.length, data.count);
-    for (const f of data.saved) assert.ok(existsSync(f));
+    // "at least one" passed for an implementation that stopped after the first.
+    // The fixture serves exactly two, and they must be two different files.
+    assert.equal(data.count, 2, `expected both letters: ${raw.slice(0, 140)}`);
+    assert.equal(data.saved.length, 2);
+    assert.equal(new Set(data.saved).size, 2, 'the second overwrote the first');
+    for (const f of data.saved) {
+      assert.ok(existsSync(f));
+      assert.ok(readFileSync(f).toString().startsWith('%PDF'), `not a PDF: ${f}`);
+    }
   });
 
   test('unfiling a document is refused when it would empty the folder set', SLOW, async () => {
