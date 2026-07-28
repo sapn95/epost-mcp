@@ -937,7 +937,13 @@ async function readStorageDocument(p, { index, title, outputDir }) {
       documentType: pick(/Document type\s+(\S+)/i),
       documentDate: pick(/Document date\s+(\d{2}\.\d{2}\.\d{4})/i),
       amount: pick(/CHF\s+([\d'’,.]+)/),
-      storedIn: [...body.matchAll(/Stored in\s+([^\n]{1,60}?)(?=\s+Example|\s+Tracking|$)/gi)].map(m => m[1].trim())[0] || null,
+      // Read the folder from its own element: in the flattened innerText the
+      // name runs into whatever follows it, which is account-specific.
+      storedIn: (() => {
+        const el = document.querySelector('.storage-location-info');
+        if (el) return clean(el.innerText).replace(/^Stored in\s*/i, '') || null;
+        return pick(/Stored in\s+(.+?)(?=\s+Tracking number|\s+Letter ID|\s+Document type|$)/i);
+      })(),
       trackingNumber: pick(/Tracking number:\s*(\S+)/i),
       letterId: pick(/Letter ID:\s*(\S+)/i),
     };
@@ -1126,6 +1132,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           const l = args.letter_id ? letters.find(x => x.id === args.letter_id)
             : typeof args.index === 'number' ? letters[args.index]
               : args.title ? letters.find(x => JSON.stringify(x).includes(args.title)) : null;
+          if (!l && args.letter_id) {
+            // Falling through to the browser here would complain about a
+            // missing index, which sends the reader looking in the wrong place.
+            return text({
+              error: `no letter ${args.letter_id} in the inbox`,
+              hint: 'it may already be archived — epost_list_storage_documents shows what is in Storage',
+            });
+          }
           if (l && await apiArchiveLetter(l.id, dir.directoryId)) {
             await saveState();
             return text({ transport: 'api', stored: l.description || l.letterTitle, folder: dir.directoryName, id: l.id });
