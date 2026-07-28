@@ -94,7 +94,12 @@ export function start() {
       const known = [...state.inbox, ...state.archive].find(l => l.id === id);
       if (!known) return send(404, { error: 'not_found' });
       if (tail === '/content') return send(200, Buffer.from('%PDF-1.4 mock'), 'application/octet-stream');
-      if (tail === '/thumbnail') return send(200, Buffer.from('\x89PNG mock'), 'image/png');
+      // The real eight PNG magic bytes. Written as a string, "\x89" goes out as
+      // two UTF-8 bytes and the fixture served something that was not a PNG at
+      // all — which a caller checking the signature would rightly reject.
+      if (tail === '/thumbnail') {
+        return send(200, Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(' mock')]), 'image/png');
+      }
       if (tail === '/restore' && req.method === 'POST') return send(204, '');
       if (tail === '/archive' && req.method === 'PATCH') {
         if (state.archive.some(l => l.id === id)) {

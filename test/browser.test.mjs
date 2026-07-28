@@ -100,6 +100,18 @@ describe('portal automation', () => {
     assert.ok(portal.state.created.includes('Neu_Angelegt'), 'the portal received the new name');
   });
 
+  test('moves into a folder whose name the portal serves decomposed', SLOW, async () => {
+    // The store sheet matched folder names byte-exactly, so the one name that
+    // arrives NFD — the whole reason this fixture has an umlaut — could be
+    // listed but never moved into.
+    const before = portal.state.stored.length;
+    const { data, raw } = await srv.call('epost_move_to_folder', { index: 1, folder: 'Example_Ümlaut' });
+    assert.ok(data.status === 'ok' || /ok/.test(raw), `move failed: ${raw.slice(0, 160)}`);
+    assert.ok(portal.state.stored.length > before, 'the sheet was committed');
+    assert.ok(portal.state.stored.at(-1).folders.some(f => f.normalize('NFC') === 'Example_Ümlaut'),
+      `the wrong folder was ticked: ${JSON.stringify(portal.state.stored.at(-1))}`);
+  });
+
   test('re-files a document, dropping the old folder in the same sheet', SLOW, async () => {
     const before = portal.state.stored.length;
     const { data, raw } = await srv.call('epost_move_to_folder', {
@@ -180,7 +192,10 @@ describe('portal automation', () => {
       'a sender whose name starts with C must survive the subject match');
     assert.equal(data.amount, '42.00');
     assert.equal(data.documentType, 'Invoice');
-    assert.equal(data.storedIn?.normalize('NFC'), 'Example_Alpha',
-      'the folder comes from its own element, not from a name-shaped boundary');
+    // Example_Beta is the DETAIL's folder; the cards behind it say Example_Alpha
+    // and Example_Ümlaut. Taking the first .storage-location-info in the
+    // document returns one of those instead.
+    assert.equal(data.storedIn?.normalize('NFC'), 'Example_Beta',
+      'the folder must come from the open detail, not from a card behind it');
   });
 });
