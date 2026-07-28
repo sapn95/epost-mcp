@@ -25,6 +25,11 @@ const letter = (id, over = {}) => ({
   ...over,
 });
 
+// As long as a real one. A seven-character stand-in slipped under the
+// redactor's minimum length, which is there so that ordinary short words are
+// not mangled — and a test that cannot trip the redactor proves nothing.
+export const TOKEN = 'tok-abcdefghijklmnopqrstuvwxyz0123456789';
+
 export function start() {
   const state = {
     inbox: [
@@ -37,6 +42,8 @@ export function start() {
     inFolder: { 'dir-one': ['arch-1'], 'dir-two': ['arch-3'] },   // arch-2 is unfiled
     deleted: [letter('del-1')],
     calls: [],
+    echoPassword: 'test-password',   // what the fake gateway above quotes back
+    echoToken: TOKEN,
   };
 
   const srv = createServer((req, res) => {
@@ -54,11 +61,19 @@ export function start() {
       return send(200, [{ tenant_id: 't-1', company_id: 0, company_name: 'Test' }]);
     }
     if (p === '/core/latest/token' && req.method === 'POST') {
-      return send(200, { access_token: 'tok-abc', token_type: 'Bearer', expires_in: 600, refresh_expires_in: 1800 });
+      return send(200, { access_token: TOKEN, token_type: 'Bearer', expires_in: 600, refresh_expires_in: 1800 });
     }
     // everything below needs one of the two documented schemes
     if (!auth.startsWith('Bearer ') && !key) return send(401, { error: 'unauthorized' });
 
+    // A gateway that quotes the request it rejected, credentials and all. Real
+    // proxies do this, and the body reaches the model through a tool result.
+    if (p === '/epost/v2/letters/echo-secret') {
+      return send(500, {
+        error: 'upstream rejected the request',
+        sent: { password: state.echoPassword, authorization: `Bearer ${state.echoToken}` },
+      });
+    }
     if (p === '/epost/v2/letters' && req.method === 'GET') return send(200, state.inbox);
     if (p === '/epost/v2/letters/deleted') return send(200, state.deleted);
     if (p === '/epost/v2/letters/inbox/count') return send(200, { count: state.inbox.filter(l => l.readStatus === 'UNREAD').length });
