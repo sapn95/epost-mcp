@@ -30,6 +30,15 @@ const letter = (id, over = {}) => ({
 // not mangled — and a test that cannot trip the redactor proves nothing.
 export const TOKEN = 'tok-abcdefghijklmnopqrstuvwxyz0123456789';
 
+// Read a request body, then hand it over. The mock used to answer before the
+// body had arrived at all, which is why nothing it contained was ever checked.
+const readBody = (req, then) => {
+  let raw = '';
+  req.on('data', c => { raw += c; });
+  req.on('end', () => then(raw));
+};
+const readForm = (req, then) => readBody(req, raw => then(new URLSearchParams(raw)));
+
 export function start() {
   const state = {
     inbox: [
@@ -57,11 +66,22 @@ export function start() {
     const auth = req.headers.authorization || '';
     const key = req.headers['x-api-key'];
 
+    // The grant used to accept anything at all, so a server that sent no
+    // username, the wrong grant_type or no tenant still passed every
+    // authentication test here and failed against the real service.
     if (p === '/core/latest/tenants' && req.method === 'POST') {
-      return send(200, [{ tenant_id: 't-1', company_id: 0, company_name: 'Test' }]);
+      return readForm(req, form => {
+        if (!form.get('username') || !form.get('password')) return send(400, { error: 'invalid_request' });
+        send(200, [{ tenant_id: 't-1', company_id: 0, company_name: 'Test' }]);
+      });
     }
     if (p === '/core/latest/token' && req.method === 'POST') {
-      return send(200, { access_token: TOKEN, token_type: 'Bearer', expires_in: 600, refresh_expires_in: 1800 });
+      return readForm(req, form => {
+        if (form.get('grant_type') !== 'password') return send(400, { error: 'unsupported_grant_type' });
+        if (!form.get('username') || !form.get('password')) return send(400, { error: 'invalid_request' });
+        if (form.get('tenant_id') !== 't-1') return send(400, { error: 'invalid_tenant' });
+        send(200, { access_token: TOKEN, token_type: 'Bearer', expires_in: 600, refresh_expires_in: 1800 });
+      });
     }
     // everything below needs one of the two documented schemes
     if (!auth.startsWith('Bearer ') && !key) return send(401, { error: 'unauthorized' });
@@ -81,7 +101,19 @@ export function start() {
       const k = (url.searchParams.get('keyword') || '').toLowerCase();
       return send(200, [...state.inbox, ...state.archive].filter(l => JSON.stringify(l).toLowerCase().includes(k)));
     }
-    if (p === '/epost/v2/letters/read' && req.method === 'POST') return send(204, '');
+    // It answered 204 to anything and changed nothing, so a set_read_status
+    // that sent the wrong ids — or none — passed on its own echo.
+    if (p === '/epost/v2/letters/read' && req.method === 'POST') {
+      return readBody(req, raw => {
+        let body; try { body = JSON.parse(raw || '{}'); } catch { return send(400, { error: 'bad_json' }); }
+        const ids = body.letterIds || body.ids || body.letter_ids;
+        if (!Array.isArray(ids) || !ids.length) return send(400, { error: 'no_ids' });
+        const status = body.readStatus || body.status;
+        if (status !== 'READ' && status !== 'UNREAD') return send(400, { error: 'bad_status' });
+        for (const l of state.inbox) if (ids.includes(l.id)) l.readStatus = status;
+        send(204, '');
+      });
+    }
     if (p === '/epost/v2/archives/directories') return send(200, DIRECTORIES);
     if (p === '/epost/v2/archives/letters') {
       const d = url.searchParams.get('directory-id');

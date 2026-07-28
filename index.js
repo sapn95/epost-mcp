@@ -85,7 +85,10 @@ function findChromium() {
         'chrome-mac/Chromium.app/Contents/MacOS/Chromium',
       ]) {
         const p = join(cache, d, rel);
-        if (existsSync(p)) return p;
+        // Recorded like every other branch: returning the path without it left
+        // epost_settings reporting that no browser had been resolved while one
+        // was already driving the portal.
+        if (existsSync(p)) return pick(p, 'chromium', 'Playwright cache — no Touch ID support');
       }
     }
   }
@@ -194,7 +197,17 @@ function writePrivate(path, bytes) {
     throw new Error(`output path must be a path, not ${typeof path}`);
   }
   const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
-  try { writeSync(fd, bytes); fchmodSync(fd, 0o600); } finally { closeSync(fd); }
+  try {
+    // writeSync may write fewer bytes than it was given, and ignoring that
+    // reported a truncated file as saved with the full byte count beside it.
+    let off = 0;
+    while (off < bytes.length) {
+      const n = writeSync(fd, bytes, off, bytes.length - off);
+      if (!n) throw new Error(`write stalled at ${off}/${bytes.length} bytes`);
+      off += n;
+    }
+    fchmodSync(fd, 0o600);
+  } finally { closeSync(fd); }
 }
 
 const oneByTitle = (items, title) => {
@@ -1521,7 +1534,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         : await apiArchiveWithFolders(args.limit || 1000);
       if (viaApi) {
         const items = Array.isArray(viaApi) ? viaApi : (viaApi.letters || viaApi.content || []);
-        return text({ transport: 'api', count: items.length, documents: items.map(apiLetterRow) });
+        // A full page cannot be told from a complete archive, and presenting
+        // one as the other is how a caller concludes a document is not there.
+        const limit = args.limit || 1000;
+        return text({
+          transport: 'api', count: items.length, documents: items.map(apiLetterRow),
+          ...(items.length >= limit ? { truncated: true, hint: `exactly ${limit} came back, so there may be more — raise limit` } : {}),
+        });
       }
       const out = await listStorageDocuments(await p(), { scrollAll: args.scroll_all === true });
       await saveState();
