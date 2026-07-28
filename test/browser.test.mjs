@@ -41,7 +41,7 @@ describe('portal automation', () => {
     // letterbox. Asserting only "an array came back" passed just as happily
     // when the browser never launched, which is how a broken run stayed green.
     const { data } = await srv.call('epost_list_letters');
-    assert.equal(data.transport, undefined, 'this is the browser path, not the API');
+    assert.equal(data.transport, 'browser', 'both paths now name the transport they answered on');
     const letters = Array.isArray(data) ? data : data.letters;
     assert.ok(Array.isArray(letters), `no letter list came back: ${JSON.stringify(data).slice(0, 120)}`);
     assert.equal(letters.length, 2, 'the fixture serves exactly two letters');
@@ -136,6 +136,28 @@ describe('portal automation', () => {
     assert.equal(data.status, 'refused', `expected a refusal, got ${JSON.stringify(data)}`);
     assert.match(data.hint, /no folder at all/, 'it explains why, and what to do instead');
     assert.equal(portal.state.stored.length, before, 'and nothing was committed');
+  });
+
+  test('tool calls that arrive together share one browser', SLOW, async () => {
+    // Two launchPersistentContext calls against one profile collide on Chrome's
+    // ProcessSingleton: one fails outright, and the stale-lock retry then
+    // deletes the lock the other is holding. A client is free to pipeline
+    // requests, so this is not an exotic case.
+    // They also navigate to three different pages on the same tab, so checking
+    // only that nobody errored would stay green while each call was handed the
+    // page another one had just loaded. Each answer has to be its own.
+    const [status, storage, letters] = await Promise.all([
+      srv.call('epost_status'), srv.call('epost_list_storage'), srv.call('epost_list_letters'),
+    ]);
+    for (const { raw } of [status, storage, letters]) {
+      assert.ok(!/ProcessSingleton|SingletonLock/.test(raw), `a concurrent launch collided: ${raw.slice(0, 120)}`);
+      assert.ok(!/^ERROR/.test(raw), `a concurrent call failed: ${raw.slice(0, 120)}`);
+    }
+    assert.equal(status.data.status, 'ok');
+    assert.ok((storage.data.folders || []).some(f => f.name.normalize('NFC') === 'Example_Alpha'),
+      `the storage call got somebody else's page: ${JSON.stringify(storage.data).slice(0, 140)}`);
+    assert.equal(letters.data.count, 2,
+      `the letters call got somebody else's page: ${JSON.stringify(letters.data).slice(0, 140)}`);
   });
 
   test('an unknown tool name is reported, not ignored', SLOW, async () => {

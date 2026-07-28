@@ -107,10 +107,26 @@ async function seedFromState(c) {
   } catch { /* a corrupt state file just means "log in again" */ }
 }
 
+// One launch at a time. Tool calls can arrive together, and two
+// launchPersistentContext calls against the same profile collide on Chrome's
+// ProcessSingleton: one of them fails outright, and the stale-lock retry below
+// then deletes the lock the other one is legitimately holding. Callers that
+// arrive during a launch wait for it instead of starting their own.
+let ctxPending = null;
+
 async function getContext(wantHeaded = false) {
   // Reuse an existing context unless we specifically need a headed one but only
   // have a headless one (the interactive login case).
   if (ctx && (!wantHeaded || headed)) return ctx;
+  if (ctxPending) {
+    await ctxPending.catch(() => {});
+    if (ctx && (!wantHeaded || headed)) return ctx;
+  }
+  ctxPending = openContext(wantHeaded).finally(() => { ctxPending = null; });
+  return ctxPending;
+}
+
+async function openContext(wantHeaded) {
   if (ctx) { await ctx.close().catch(() => {}); ctx = null; }
   if (browserObj) { await browserObj.close().catch(() => {}); browserObj = null; }
 
@@ -154,6 +170,21 @@ async function getPage(wantHeaded = false) {
   const [existing] = c.pages();
   return existing ?? c.newPage();
 }
+
+// Playwright's nth(-1) means "the last one" and a negative array index is simply
+// undefined, so a nonsense index quietly acted on a different document than the
+// one asked for. An index that cannot be honoured is an error, not a guess.
+function checkIndex(index, n, what) {
+  if (!Number.isInteger(index) || index < 0 || index >= n) {
+    throw new Error(`index ${index} out of range (${n} ${what})`);
+  }
+}
+
+// A file name is assembled from values the service supplies — a letter id, a
+// date it reported. join() resolves "../" happily, so an id shaped like a path
+// would write outside the directory the caller named. Keep name parts to
+// characters that can only ever be a name.
+const namePart = v => String(v ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').replace(/^\.+/, '_') || 'x';
 
 // Persist cookies/localStorage so the session survives a server restart.
 async function saveState() {
@@ -325,13 +356,21 @@ async function withApi(fn) {
   const auth = await apiAuth();
   if (!auth) return null;
   const bearer = () => (apiToken ? apiToken.value : null);   // null when the key alone authenticates
+  // A call that works is proof the API is reachable. Without this, one early
+  // failure left epost_settings reporting the API unavailable for the life of
+  // the process, long after it had recovered.
+  const ok = v => { apiUnavailable = null; return v; };
   try {
-    return await fn(bearer());
+    return ok(await fn(bearer()));
   } catch (e) {
     if (e.status === 401) {
       apiToken = null;
       if (await apiAuth()) {
-        try { return await fn(bearer()); } catch (e2) {
+        try { return ok(await fn(bearer())); } catch (e2) {
+          // Same policy as below: an authoritative "no" is still a no on the
+          // second attempt. Swallowing it as unavailability sent the caller to
+          // the browser to do something the service had just refused.
+          if (e2.status >= 400 && e2.status < 500 && e2.status !== 401 && e2.status !== 404) throw e2;
           apiUnavailable = e2.message;
           if (DEBUG) console.error('[api] retry failed:', e2.message);
           return null;
@@ -386,13 +425,22 @@ async function apiArchiveWithFolders(limit = 1000) {
   const dirs = await apiListDirectories();
   if (!dirs) return items;
   const folders = new Map();
+  // A folder that cannot be listed tells us nothing about what is in it. Folding
+  // that into the same `null` as "in no folder" would report filed documents as
+  // unfiled — and a caller acting on that would re-file the whole archive.
+  let complete = true;
   for (const d of dirs.filter(x => x.directoryId)) {
     const inDir = await apiListArchive(d.directoryId, limit);
+    if (inDir === null) { complete = false; continue; }
     for (const l of (Array.isArray(inDir) ? inDir : (inDir?.letters || []))) {
       folders.set(l.id, [...(folders.get(l.id) || []), d.directoryName]);
     }
   }
-  return items.map(l => ({ ...l, directoryNames: folders.get(l.id) || null }));
+  return items.map(l => ({
+    ...l,
+    // undefined = not looked up, as apiLetterRow already documents
+    directoryNames: folders.get(l.id) ?? (complete ? null : undefined),
+  }));
 }
 
 const apiLetterContent = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}/content`, { token: t, raw: true }));
@@ -496,7 +544,7 @@ async function downloadLetter(p, index, outputDir, meta) {
   mkdirSync(outputDir, { recursive: true });
   const wrappers = p.locator('div.letter-wrapper');
   const n = await wrappers.count();
-  if (index >= n) throw new Error(`index ${index} out of range (${n} letters)`);
+  checkIndex(index, n, 'letters');
   await wrappers.nth(index).click();
   await p.waitForTimeout(3500);
 
@@ -514,7 +562,7 @@ async function downloadLetter(p, index, outputDir, meta) {
   ]);
   const date = meta?.dates?.[0];
   const stamp = date ? date.split('.').reverse().join('-') : 'undated';
-  const saved = join(outputDir, `${stamp}_ePost_${index}.pdf`);
+  const saved = join(outputDir, `${namePart(stamp)}_ePost_${namePart(index)}.pdf`);
   await dl.saveAs(saved);
 
   await p.keyboard.press('Escape').catch(() => {});
@@ -624,6 +672,18 @@ async function createFolder(p, name) {
   if (await createBtn.count()) await createBtn.click({ timeout: 8000, force: true });
   else await p.keyboard.press('Enter');
   await p.waitForTimeout(2500);
+  // Clicking is not creating. A duplicate name, or one the portal will not
+  // accept, leaves the dialog open with its complaint in it — and this reported
+  // a folder that does not exist, which the next store call then cannot find.
+  if (await input.isVisible().catch(() => false)) {
+    const why = await p.locator('[id*="folder"]').filter({ hasText: /already|exists|invalid|ung.ltig|vorhanden/i })
+      .first().innerText().catch(() => '');
+    return {
+      status: 'refused',
+      name,
+      reason: why.replace(/\s+/g, ' ').trim().slice(0, 200) || 'the portal kept the dialog open',
+    };
+  }
   return { status: 'ok', created: name };
 }
 
@@ -649,7 +709,7 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   const cards = p.locator('div.letter-wrapper');
   let card;
   if (typeof index === 'number') {
-    if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} loaded documents)`);
+    checkIndex(index, await cards.count(), 'loaded documents');
     card = cards.nth(index);
   } else if (title) {
     card = p.locator('div.letter-wrapper', { hasText: title }).first();
@@ -754,6 +814,13 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   return { status: 'ok', moved: { index, title, folder } };
 }
 
+// Where the browser is, with nothing that could be replayed: OIDC steps carry a
+// code, a state and a session id in the query string.
+function safeUrl(u) {
+  try { const x = new URL(u); return `${x.origin}${x.pathname}${x.search ? '?…' : ''}`; }
+  catch { return '(unparsable url)'; }
+}
+
 // The SwissID account e-mail, used to skip the "which account?" step.
 function swissIdUser() {
   return envOrKeychain('EPOST_SWISSID_USER', 'epost-mcp-swissid-user');
@@ -791,7 +858,11 @@ async function assistedLogin(p, waitMs = 300000) {
   while (Date.now() < deadline) {
     await p.waitForTimeout(1500);
     const u = p.url();
-    if (DEBUG && u !== lastSeen) { console.error('[login] at', u.slice(0, 90)); lastSeen = u; }
+    // Origin and path only. A SwissID/OIDC step carries the authorisation code,
+    // the state and the session id in its query string, and truncating at 90
+    // characters is not redaction — it is a coin toss about which of them ends
+    // up in the log the user pastes into a bug report.
+    if (DEBUG && u !== lastSeen) { console.error('[login] at', safeUrl(u)); lastSeen = u; }
 
     if (/app\.epost\.ch/.test(u) && !/oauth_login|openid-connect/.test(u)
       && (u.includes('DigitalLetterboxOverview')
@@ -853,7 +924,7 @@ async function storeLetter(p, { index, title, folder }) {
   await cards.first().waitFor({ state: 'visible', timeout: 20000 }).catch(() => {});
   let card;
   if (typeof index === 'number') {
-    if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} letters)`);
+    checkIndex(index, await cards.count(), 'letters');
     card = cards.nth(index);
   } else if (title) {
     card = p.locator('div.letter-wrapper', { hasText: title }).first();
@@ -940,7 +1011,7 @@ async function readStorageDocument(p, { index, title, outputDir }) {
   const cards = p.locator('div.letter-wrapper');
   let card;
   if (typeof index === 'number') {
-    if (index >= await cards.count()) throw new Error(`index ${index} out of range (${await cards.count()} documents)`);
+    checkIndex(index, await cards.count(), 'documents');
     card = cards.nth(index);
   } else if (title) {
     card = p.locator('div.letter-wrapper', { hasText: title }).first();
@@ -992,12 +1063,17 @@ async function readStorageDocument(p, { index, title, outputDir }) {
         target.click({ timeout: 10000 }),
       ]);
       const stamp = (meta.documentDate || '').split('.').reverse().join('-') || 'undated';
-      saved = join(outputDir, `${stamp}_ePostStorage_${index ?? 'x'}.pdf`);
+      saved = join(outputDir, `${namePart(stamp)}_ePostStorage_${namePart(index ?? 'x')}.pdf`);
       await d.saveAs(saved);
     }
   }
   await p.keyboard.press('Escape').catch(() => {});
   await p.waitForTimeout(1200);
+  // A caller that asked for the file and got `saved: null` beside `status: ok`
+  // was told the whole request succeeded. It did not: the reading half did.
+  if (outputDir && !saved) {
+    return { status: 'partial', index, ...meta, saved: null, error: 'no download control on the document view — the metadata below was read, the file was not saved' };
+  }
   return { status: 'ok', index, ...meta, saved };
 }
 
@@ -1041,13 +1117,43 @@ const TOOLS = [
 const server = new Server({ name: PKG.name, version: PKG.version }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOLS }));
 
+// One browser-backed tool call at a time. Every one of them drives the same
+// page: two running together interleave, so one call's goto lands while the
+// other is mid-click and both are handed an answer that belongs to neither
+// request. A client is free to pipeline requests, so this is not exotic.
+let browserQueue = Promise.resolve();
+function acquireBrowser() {
+  let release;
+  const held = new Promise(r => { release = r; });
+  const ourTurn = browserQueue;
+  browserQueue = browserQueue.then(() => held);
+  return ourTurn.then(() => release);
+}
+
 server.setRequestHandler(CallToolRequestSchema, async req => {
   const { name, arguments: args = {} } = req.params;
   const text = s => ({ content: [{ type: 'text', text: typeof s === 'string' ? s : JSON.stringify(s, null, 1) }] });
+
+  // The page the browser-backed tools work on, resolved on first use — and only
+  // then does this call take its turn at the browser. A tool the API serves in
+  // full never waits for one that does not, and never launches anything.
+  let pending = null;
+  let releaseBrowser = null;
+  const p = async () => {
+    // `browser` was enforced; `api` was not, so pinning to the API still fell
+    // through to the portal, quietly doing something other than what was asked,
+    // on a machine that may have no browser at all. A pin now means what it says
+    // in both directions.
+    if (TRANSPORT === 'api') {
+      throw new Error(`${name} needs the browser, and EPOST_TRANSPORT=api pins this server to the public API — unset it or set it to "auto" to allow the fallback`);
+    }
+    releaseBrowser ??= await acquireBrowser();
+    return (pending ??= getPage());
+  };
+
   try {
     if (name === 'epost_status') {
-      const p = await getPage();
-      const status = await ensureSession(p);
+      const status = await ensureSession(await p());
       await saveState();
       return text({ status });
     }
@@ -1103,23 +1209,6 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         },
       });
     }
-    // The page the browser-backed tools work on, resolved on first use. It used
-    // to be launched here for every tool, which the comment claimed it was not:
-    // `epost_search`, `epost_get_letter` and `epost_unread_count` are served
-    // entirely by the API and never touch it, yet they launched a browser — and
-    // failed outright where none is installed, which is precisely the situation
-    // the API transport exists for.
-    let pending = null;
-    const p = () => {
-      // `browser` was enforced; `api` was not, so pinning to the API still fell
-      // through to the portal whenever a call could not be served — quietly
-      // doing something other than what was asked, on a machine that may have
-      // no browser at all. A pin now means what it says in both directions.
-      if (TRANSPORT === 'api') {
-        throw new Error(`${name} needs the browser, and EPOST_TRANSPORT=api pins this server to the public API — unset it or set it to "auto" to allow the fallback`);
-      }
-      return (pending ??= getPage());
-    };
 
     if (name === 'epost_list_letters') {
       const viaApi = await apiListLetters(args.limit || 200);
@@ -1128,7 +1217,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
       const out = await listLetters(await p());
       await saveState();
-      return text(out);
+      // The same envelope as the API path. Returning a bare array here meant a
+      // client read `.letters` while the API was up and got undefined the moment
+      // it was not — a shape that changed under them for reasons of their own.
+      return text({ transport: 'browser', count: out.length, letters: out });
     }
     if (name === 'epost_download_letter') {
       const apiLetters = await apiListLetters(200);
@@ -1139,7 +1231,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           if (bytes) {
             mkdirSync(args.output_dir, { recursive: true });
             const stamp = (l.receivedDateTime || '').slice(0, 10) || 'undated';
-            const saved = join(args.output_dir, `${stamp}_ePost_${args.index ?? l.id}.pdf`);
+            const saved = join(args.output_dir, `${namePart(stamp)}_ePost_${namePart(args.index ?? l.id)}.pdf`);
             writeFileSync(saved, bytes);
             return text({ transport: 'api', saved, bytes: bytes.length, description: l.description });
           }
@@ -1290,9 +1382,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             const bytes = await apiLetterContent(l.id);
             if (bytes) {
               mkdirSync(args.output_dir, { recursive: true });
-              saved = join(args.output_dir, `${(l.receivedDateTime || '').slice(0, 10) || 'undated'}_ePostStorage_${args.index ?? l.id}.pdf`);
+              saved = join(args.output_dir, `${namePart((l.receivedDateTime || '').slice(0, 10) || 'undated')}_ePostStorage_${namePart(args.index ?? l.id)}.pdf`);
               writeFileSync(saved, bytes);
             }
+          }
+          // Same rule as the browser path: asking for the file and being told
+          // "ok" with nothing saved is a wrong answer about half the request.
+          if (args.output_dir && !saved) {
+            return text({ transport: 'api', status: 'partial', ...apiLetterRow(l, args.index ?? 0), saved: null, error: 'the document content could not be fetched — the metadata below was read, the file was not saved' });
           }
           return text({ transport: 'api', ...apiLetterRow(l, args.index ?? 0), saved });
         }
@@ -1323,6 +1420,9 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     return text({ error: `unknown tool ${name}` });
   } catch (e) {
     return { content: [{ type: 'text', text: 'ERROR: ' + (e.message || String(e)) }], isError: true };
+  } finally {
+    // Whatever happened, the next caller gets the browser.
+    releaseBrowser?.();
   }
 });
 

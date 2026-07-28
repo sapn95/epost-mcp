@@ -35,7 +35,7 @@ API does not cover.
 
 ## Prerequisites
 
-- **Node.js ≥ 18**
+- **Node.js ≥ 20.19**
 - A Chromium managed by Playwright
 - A Swiss **ePost** account with the Scanning-Service, reachable via **SwissID**
 
@@ -243,9 +243,6 @@ Or add it directly to `~/.claude.json`:
 | `epost_status` | — | `{ status: "ok" \| "login_required" }` |
 | `epost_login` | `wait_seconds` (optional, default 300) | Opens a visible window and drives the SwissID chain up to the Touch ID prompt. `{ status, browser, message }` |
 | `epost_settings` | — | Resolved browser + why, Touch ID capability, paths, whether the account e-mail is set |
-| `epost_passkey_status` | — | `{ passkey: "enrolled" \| "none", rpId, signCount }` |
-| `epost_passkey_register` | — | **One-time.** Opens a visible window with a virtual FIDO2 authenticator. Returns `rejected` against SwissID — see the passkey section. |
-| `epost_passkey_forget` | — | Deletes the locally stored passkey. `{ removed }` |
 | `epost_list_letters` | — | Array of `{ index, sender, title, dates, preview }` (newest first) |
 | `epost_download_letter` | `index` (number), `output_dir` (string) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |

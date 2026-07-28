@@ -27,7 +27,12 @@ const letter = (id, over = {}) => ({
 
 export function start() {
   const state = {
-    inbox: [letter('inbox-1'), letter('inbox-2', { description: null, readStatus: 'READ' })],
+    inbox: [
+      letter('inbox-1'), letter('inbox-2', { description: null, readStatus: 'READ' }),
+      // The file name is built from what the service says. A service that says
+      // something path-shaped must not decide where the file lands.
+      letter('inbox-3', { receivedDateTime: '../../../../tmp/pwned' }),
+    ],
     archive: [letter('arch-1'), letter('arch-2', { description: null }), letter('arch-3')],
     inFolder: { 'dir-one': ['arch-1'], 'dir-two': ['arch-3'] },   // arch-2 is unfiled
     deleted: [letter('del-1')],
