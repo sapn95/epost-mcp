@@ -603,6 +603,7 @@ async function downloadLetter(p, index, outputDir, meta) {
   const stamp = date ? date.split('.').reverse().join('-') : 'undated';
   const saved = join(outputDir, `${namePart(stamp)}_ePost_${namePart(index)}.pdf`);
   await dl.saveAs(saved);
+  try { chmodSync(saved, 0o600); } catch { /* the download may live elsewhere */ }
 
   await p.keyboard.press('Escape').catch(() => {});
   await p.waitForTimeout(1500);
@@ -1120,6 +1121,7 @@ async function readStorageDocument(p, { index, title, outputDir }) {
       const stamp = (meta.documentDate || '').split('.').reverse().join('-') || 'undated';
       saved = join(outputDir, `${namePart(stamp)}_ePostStorage_${namePart(index ?? 'x')}.pdf`);
       await d.saveAs(saved);
+      try { chmodSync(saved, 0o600); } catch { /* the download may live elsewhere */ }
     }
   }
   await p.keyboard.press('Escape').catch(() => {});
@@ -1301,7 +1303,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             mkdirSync(args.output_dir, { recursive: true });
             const stamp = (l.receivedDateTime || '').slice(0, 10) || 'undated';
             const saved = join(args.output_dir, `${namePart(stamp)}_ePost_${namePart(args.index ?? l.id)}.pdf`);
-            writeFileSync(saved, bytes);
+            // Correspondence: written with the process umask it can land
+            // group- and world-readable.
+            writeFileSync(saved, bytes, { mode: 0o600 });
+            chmodSync(saved, 0o600);
             return text({ transport: 'api', saved, bytes: bytes.length, description: l.description });
           }
         }
@@ -1405,7 +1410,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       const bytes = await apiThumbnail(args.letter_id);
       if (!bytes) return text({ error: 'needs the API', hint: apiUnavailable });
       mkdirSync(dirname(args.output_path), { recursive: true });
-      writeFileSync(args.output_path, bytes);
+      writeFileSync(args.output_path, bytes, { mode: 0o600 });
+      chmodSync(args.output_path, 0o600);
       return text({ transport: 'api', saved: args.output_path, bytes: bytes.length });
     }
     if (name === 'epost_list_storage') {
@@ -1465,7 +1471,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             if (bytes) {
               mkdirSync(args.output_dir, { recursive: true });
               saved = join(args.output_dir, `${namePart((l.receivedDateTime || '').slice(0, 10) || 'undated')}_ePostStorage_${namePart(args.index ?? l.id)}.pdf`);
-              writeFileSync(saved, bytes);
+              // Correspondence: written with the process umask it can land
+            // group- and world-readable.
+            writeFileSync(saved, bytes, { mode: 0o600 });
+            chmodSync(saved, 0o600);
             }
           }
           // Same rule as the browser path: asking for the file and being told

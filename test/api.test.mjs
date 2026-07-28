@@ -1,6 +1,6 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { start, TOKEN } from './mock-epost.mjs';
@@ -123,6 +123,14 @@ describe('downloads', () => {
     const rel = relative(dir, data.saved);
     assert.ok(rel && !rel.startsWith('..') && !isAbsolute(rel), `escaped to ${data.saved}`);
     assert.ok(existsSync(data.saved));
+  });
+
+  test('a saved letter is not readable by everyone else on the machine', async () => {
+    // Correspondence written with the process umask lands -rw-r--r-- on a
+    // normal account: every local user can read the mail.
+    const { data } = await srv.call('epost_download_letter', { index: 0, output_dir: out });
+    const mode = statSync(data.saved).mode & 0o777;
+    assert.equal(mode, 0o600, `saved as ${mode.toString(8)}`);
   });
 
   test('saves a thumbnail', async () => {
