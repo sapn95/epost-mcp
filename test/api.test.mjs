@@ -141,6 +141,15 @@ describe('archiving', () => {
     assert.ok(Array.isArray(data.available) && data.available.length, 'lists what is available');
   });
 
+  test('a letter_id that is not in the inbox says so, and says where to look', async () => {
+    // arch-1 exists, but it is already in Storage. Falling through to the
+    // browser here used to report a missing index, sending the reader to the
+    // wrong problem entirely.
+    const { data } = await srv.call('epost_store_letter', { letter_id: 'arch-1', folder: 'Example_Alpha' });
+    assert.match(data.error, /no letter arch-1 in the inbox/);
+    assert.match(data.hint, /epost_list_storage_documents/, 'it names the tool that would show it');
+  });
+
   test('marks letters read', async () => {
     const { data } = await srv.call('epost_set_read_status', { letter_ids: ['inbox-1'], status: 'READ' });
     assert.equal(data.updated, 1);
@@ -181,6 +190,34 @@ describe('transport selection', () => {
     const { data } = await s.call('epost_settings');
     assert.equal(data.transport, 'browser');
     assert.equal(mock.state.calls.length, before, 'no API traffic when pinned to the browser');
+    s.stop();
+  });
+
+  test('an API-only tool works on a machine with no browser at all', async () => {
+    // The dispatcher used to launch a browser before deciding which tool ran,
+    // so every one of these failed with "EPOST_BROWSER not found" — on exactly
+    // the headless machine the API transport exists to serve.
+    const s = await startServer({
+      EPOST_API_BASE: mock.base, EPOST_TRANSPORT: 'api',
+      EPOST_BROWSER: '/definitely/not/a/browser',
+    });
+    for (const tool of ['epost_unread_count', 'epost_search', 'epost_get_letter']) {
+      const { data, raw } = await s.call(tool, { keyword: 'Someone', letter_id: 'inbox-1' });
+      assert.ok(!/EPOST_BROWSER/.test(raw), `${tool} launched a browser it never uses: ${raw.slice(0, 80)}`);
+      assert.equal(data.transport, 'api', `${tool} did not answer over the API`);
+    }
+    s.stop();
+  });
+
+  test('pinned to the API, a browser-only call is refused rather than quietly redirected', async () => {
+    // Only "browser" used to be enforced. Pinning to "api" and then falling
+    // through to the portal is the pin not meaning anything.
+    const s = await startServer({
+      EPOST_API_BASE: mock.base, EPOST_TRANSPORT: 'api', EPOST_BROWSER: '/definitely/not/a/browser',
+    });
+    const { raw } = await s.call('epost_create_folder', { name: 'Whatever' });
+    assert.match(raw, /EPOST_TRANSPORT=api/, 'it names the pin as the reason');
+    assert.ok(!/not found \(looked at/.test(raw), 'it did not try to launch a browser first');
     s.stop();
   });
 

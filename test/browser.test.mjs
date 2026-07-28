@@ -37,9 +37,18 @@ after(async () => {
 
 describe('portal automation', () => {
   test('finds the letters through the dashboard', SLOW, async () => {
+    // The portal lands on a dashboard and the automation clicks through to the
+    // letterbox. Asserting only "an array came back" passed just as happily
+    // when the browser never launched, which is how a broken run stayed green.
     const { data } = await srv.call('epost_list_letters');
     assert.equal(data.transport, undefined, 'this is the browser path, not the API');
-    assert.ok(Array.isArray(data) || Array.isArray(data.letters) || data.length >= 0);
+    const letters = Array.isArray(data) ? data : data.letters;
+    assert.ok(Array.isArray(letters), `no letter list came back: ${JSON.stringify(data).slice(0, 120)}`);
+    assert.equal(letters.length, 2, 'the fixture serves exactly two letters');
+    // `date` is the field the API path reports, so a client that falls back
+    // from one transport to the other must still find it here.
+    assert.deepEqual(letters.map(l => l.date), ['01.01.2020', '02.02.2020']);
+    assert.deepEqual(letters.map(l => l.sender), ['ePost Scancenter', 'ePost Scancenter']);
   });
 
   test('lists Storage documents with their folder tag', SLOW, async () => {
@@ -118,11 +127,15 @@ describe('portal automation', () => {
   });
 
   test('unfiling a document is refused when it would empty the folder set', SLOW, async () => {
-    // The portal will not commit an empty selection, so removing a document's
-    // only folder cannot work — the tool must say so rather than claim success.
-    const { data, raw } = await srv.call('epost_unfile_from_folder', { index: 0, folder: 'Example_Alpha' });
-    const msg = JSON.stringify(data) + raw;
-    assert.ok(msg.length > 0, 'the tool answered');
+    // The portal will not commit an empty selection: it just leaves the sheet
+    // open. The tool used to click Move and report success regardless, telling
+    // the caller a document had left a folder it was still in. This assertion
+    // used to be `msg.length > 0`, which held however broken the code was.
+    const before = portal.state.stored.length;
+    const { data } = await srv.call('epost_unfile_from_folder', { index: 0, folder: 'Example_Alpha' });
+    assert.equal(data.status, 'refused', `expected a refusal, got ${JSON.stringify(data)}`);
+    assert.match(data.hint, /no folder at all/, 'it explains why, and what to do instead');
+    assert.equal(portal.state.stored.length, before, 'and nothing was committed');
   });
 
   test('an unknown tool name is reported, not ignored', SLOW, async () => {
@@ -132,7 +145,15 @@ describe('portal automation', () => {
 
   test('opening a Storage document reads its detail rather than the card', SLOW, async () => {
     const before = portal.state.detailOpened.length;
-    await srv.call('epost_read_storage_document', { index: 0 });
+    const { data } = await srv.call('epost_read_storage_document', { index: 0 });
     assert.ok(portal.state.detailOpened.length > before, 'the card body was clicked, not the wrapper');
+    // The detail is the only place the real subject appears — the card shows
+    // "Gescannter Brief" for everything — so reading it is the whole point.
+    assert.equal(data.subject, 'Invoice from Caramba Example AG',
+      'a sender whose name starts with C must survive the subject match');
+    assert.equal(data.amount, '42.00');
+    assert.equal(data.documentType, 'Invoice');
+    assert.equal(data.storedIn?.normalize('NFC'), 'Example_Alpha',
+      'the folder comes from its own element, not from a name-shaped boundary');
   });
 });
