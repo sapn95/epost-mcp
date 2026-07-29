@@ -320,6 +320,38 @@ describe('portal automation', () => {
       'the portal was told to create it twice');
   });
 
+  test('a portal taking its time over the commit is not a portal refusing it', SLOW, async () => {
+    // Round 16 waited for the store sheet to GO rather than sleeping and
+    // looking: "a portal taking its time over the commit is not a portal
+    // refusing it, and a flat sleep would turn the slow one into a wrong answer
+    // in the other direction." Its own message credits epost_move_to_folder
+    // with having read that signal first — and this one reads it four seconds
+    // after the click, whatever the page is doing. So a move the portal had
+    // ACCEPTED came back `status: refused, "the portal did not accept the
+    // folder sheet"`, and the tool then pressed Cancel on a sheet that was
+    // mid-commit. The document is in the folder and the caller was told it is
+    // not, which is the answer that has them file it somewhere else.
+    // epost_create_folder decides the same way, off the same kind of sleep.
+    const before = portal.state.stored.length;
+    portal.state.commitDelayMs = 6000;
+    portal.state.createDelayMs = 6000;
+    try {
+      const { data, raw } = await srv.call('epost_move_to_folder', { index: 2, folder: 'Example_Gamma' });
+      assert.equal(portal.state.stored.length, before + 1, 'the fixture is supposed to accept this move');
+      assert.notEqual(data.status, 'refused',
+        `a move the portal accepted was reported as refused: ${raw.slice(0, 200)}`);
+      assert.ok(data.moved, `it was not reported as a move at all: ${raw.slice(0, 200)}`);
+
+      const folder = await srv.call('epost_create_folder', { name: 'Langsam_Angelegt' });
+      assert.ok(portal.state.created.includes('Langsam_Angelegt'), 'the fixture is supposed to accept this name');
+      assert.equal(folder.data.status, 'ok',
+        `a folder the portal created was reported as refused: ${folder.raw.slice(0, 200)}`);
+    } finally {
+      portal.state.commitDelayMs = 0;
+      portal.state.createDelayMs = 0;
+    }
+  });
+
   test('a remove_from the sheet does not offer is refused, and nothing is changed', SLOW, async () => {
     // The destination was ticked, the sheet committed, and the tool reported a
     // move that had only ever added — the old membership stayed exactly where

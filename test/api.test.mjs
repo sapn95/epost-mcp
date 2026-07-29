@@ -531,6 +531,35 @@ describe('the API answering no', () => {
     }
   });
 
+  test('and neither is an answer with no bytes in it at all', async () => {
+    // The check above is asked "is this not a letter?" and answers with the
+    // byte COUNT — `notPdf = bytes.length` — so the emptiest answer of the lot
+    // walks through the guard written to stop it, because zero is falsy. A
+    // gateway that truncates produces exactly that, and so does a 204: a raw
+    // fetch reads the body before anyone looks at the status. Both tools wrote
+    // a 0-byte file and reported it as saved with `bytes: 0` beside it, which
+    // is a letter that arrived, as far as anything downstream can tell. The
+    // thumbnail endpoint, which reads the first four bytes instead of counting
+    // them, has always refused this.
+    const bad = mkdtempSync(join(tmpdir(), 'epost-nobytes-'));
+    m.state.contentEmpty = true;
+    try {
+      const { data, raw } = await s.call('epost_download_letter', { letter_id: 'inbox-1', output_dir: bad });
+      assert.ok(!data.saved, `an empty answer was saved as a letter: ${raw.slice(0, 200)}`);
+      assert.match(data.hint, /no bytes/, `it does not say what came back instead: ${raw.slice(0, 200)}`);
+
+      const doc = await s.call('epost_read_storage_document', { letter_id: 'arch-1', output_dir: bad });
+      assert.equal(doc.data.status, 'partial', `an empty answer was reported as a saved document: ${doc.raw.slice(0, 200)}`);
+      assert.equal(doc.data.saved, null);
+      assert.match(doc.data.error, /no bytes/);
+      assert.equal(doc.data.id, 'arch-1', 'the metadata half is still reported');
+
+      assert.deepEqual(readdirSync(bad), [], 'an empty file was written under a letter\'s name regardless');
+    } finally {
+      m.state.contentEmpty = false;
+    }
+  });
+
   test('a document that is not in Storage is reported as missing, not looked for elsewhere', async () => {
     // The API answered and there is no such document. Asking the browser the
     // same question, where "index" means something else entirely, is not a
@@ -796,6 +825,58 @@ describe('the API answering no', () => {
     assert.match(raw, /needs the browser|EPOST_TRANSPORT/,
       `a position the portal can resolve was refused too: ${raw.slice(0, 200)}`);
   });
+
+  test('a refusal is a refusal however the letter was addressed', async () => {
+    // The fall-through above is right for a service that could not answer. It
+    // is wrong for one that answered no, and that is the whole reason withApi
+    // rethrows a 4xx instead of returning null: "treating it as unavailable
+    // would silently retry the operation through the browser, where it may do
+    // something subtly different, or hand the caller a fallback result for a
+    // request the service rejected." Last round caught that rethrow so the tool
+    // could report it — and then reported it only when the caller had passed a
+    // letter_id. An index or a title carried on into the portal exactly as
+    // before, so a 400 the service had just answered with became a browser
+    // launch and a store of whatever happens to sit at that position, in a list
+    // the portal numbers differently from the API. Before the catch existed the
+    // same 400 at least came back as an error.
+    for (const sel of [{ index: 0 }, { title: 'inbox-2' }]) {
+      const how = JSON.stringify(sel);
+      m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-1/archive', status: 400 });
+      m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-2/archive', status: 400 });
+      const { raw, data } = await s.call('epost_store_letter', { ...sel, folder: 'Example_Alpha' });
+      m.state.forceStatus.length = 0;
+      assert.doesNotMatch(raw, /needs the browser|EPOST_TRANSPORT/,
+        `${how}: a request the service refused was handed to the portal to try again: ${raw.slice(0, 200)}`);
+      assert.match(data.error || raw, /could not be archived/, `${how}: ${raw.slice(0, 200)}`);
+      assert.match(data.hint || raw, /400/, `${how}: the refusal the service gave is passed on`);
+      assert.match(data.note || raw, /nothing was filed/, `${how}: ${raw.slice(0, 200)}`);
+    }
+  });
+
+  test('an id the service has never heard of is not a broken transport', async () => {
+    // ed6806d taught the two folder-scoped guards that withApi's null means two
+    // things and that a 404 is not "the API is unavailable" — it is the service
+    // being reached and answering "not here", recorded in apiRefusal with
+    // apiUnavailable CLEARED. The tools that act on ONE named letter were left
+    // saying "needs the API" about an id with a typo in it, with the 404 that
+    // says otherwise sitting in the hint directly underneath, while
+    // epost_settings in the same process reports the API as working.
+    // epost_get_letter, the sibling that was looked at, names both.
+    for (const [tool, args] of [
+      ['epost_restore_letter', { letter_id: 'no-such-letter' }],
+      ['epost_delete_letter', { letter_id: 'no-such-letter', confirm: true }],
+      ['epost_download_thumbnail', { letter_id: 'no-such-letter', output_path: join(dir, 'no-such.png') }],
+    ]) {
+      const { data, raw } = await s.call(tool, args);
+      assert.doesNotMatch(data.error || raw, /needs the API/,
+        `${tool}: a 404 was reported as the transport being unusable: ${raw.slice(0, 200)}`);
+      assert.match(raw, /404/, `${tool}: the reason the service gave is passed on`);
+      assert.match(raw, /no-such-letter/, `${tool}: it does not name what was asked for`);
+    }
+    const { data } = await s.call('epost_settings');
+    assert.doesNotMatch(data.api, /unavailable/,
+      `the same process calls the API healthy while a tool called it unusable: ${data.api}`);
+  });
 });
 
 // An inbox nobody has archived in a while. The tools that resolve a letter_id
@@ -842,6 +923,29 @@ describe('an inbox longer than one listing', () => {
     const { data } = await s.call('epost_store_letter', { letter_id: 'no-such-letter', folder: 'Example_Alpha' });
     assert.match(data.error, /no letter no-such-letter in the inbox/);
     assert.match(data.hint, /epost_list_storage_documents/);
+  });
+
+  test('a substring is not resolved against a window either', async () => {
+    // letterInWindow was written for the id one line up. The title beside it
+    // still read the edge of our own request as the edge of the inbox — and a
+    // title is resolved by oneByTitle, whose entire job is to refuse to guess:
+    // it counts the matches and will not act on more than one, because "the
+    // first row containing this text" archives a neighbour just as readily as
+    // the intended letter. Counted inside a window, that count is not the
+    // letterbox's. "bulk-25" names eleven letters here, ten of them past the
+    // 200 this asks for, so the one substring that is REFUSED as ambiguous
+    // against a short inbox quietly filed the first of the eleven against a
+    // long one. An id can be checked past the window; a substring cannot.
+    const matches = m.state.inbox.filter(l => JSON.stringify(l).includes('bulk-25'));
+    assert.ok(matches.length > 1, `the fixture is supposed to repeat this substring: ${matches.length}`);
+    const { data, raw } = await s.call('epost_store_letter', { title: 'bulk-25', folder: 'Example_Alpha' });
+    assert.ok(!data.transport, `it picked one of ${matches.length} letters: ${raw.slice(0, 200)}`);
+    assert.match(data.error || raw, /bulk-25/);
+    assert.match(raw, /200|window|longer/, `it does not say why it cannot answer: ${raw.slice(0, 200)}`);
+    assert.match(data.hint || raw, /letter_id/, 'and it does not say what would work instead');
+    for (const l of matches) {
+      assert.ok(!m.state.inFolder['dir-one'].includes(l.id), `${l.id} was filed anyway`);
+    }
   });
 
   test('a letter the service says is already archived is answered, not thrown', async () => {
@@ -903,6 +1007,26 @@ describe('an archive longer than one listing', () => {
     // there would send every caller off to raise a limit for nothing.
     const { data } = await s.call('epost_read_storage_document', { letter_id: 'no-such-doc', limit: 2000 });
     assert.match(data.error, /no such document in Storage/);
+  });
+
+  test('and a substring is not resolved against the window it came back in', async () => {
+    // The same sibling as in the inbox block: the not-found answer learned that
+    // a full page proves nothing about what lies past it, and the substring
+    // resolved against that page did not. oneByTitle refuses to act on more
+    // than one match — "Storage cards show only a date, and dates repeat" — so
+    // counting the matches in a window turns the refusal into a guess.
+    // "bulk-119" names eleven documents, ten of them past the default 1000.
+    const matches = m.state.archive.filter(l => JSON.stringify(l).includes('bulk-119'));
+    assert.ok(matches.length > 1, `the fixture is supposed to repeat this substring: ${matches.length}`);
+    const { data, raw } = await s.call('epost_read_storage_document', { title: 'bulk-119' });
+    assert.ok(!data.id, `it picked one of ${matches.length} documents: ${raw.slice(0, 200)}`);
+    assert.match(data.error || raw, /bulk-119/);
+    assert.match(data.hint || raw, /limit|letter_id/, `it does not say what would work instead: ${raw.slice(0, 200)}`);
+    // Raising the window past the archive makes it answerable again — and the
+    // answer is the refusal oneByTitle was written to give.
+    const { raw: wide } = await s.call('epost_read_storage_document', { title: 'bulk-119', limit: 2000 });
+    assert.match(wide, new RegExp(`matches ${matches.length} letters`),
+      `with the whole archive in view it still did not count them: ${wide.slice(0, 200)}`);
   });
 });
 

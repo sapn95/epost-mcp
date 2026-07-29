@@ -71,6 +71,13 @@ export function start() {
     // with a byte count beside it. Nothing here could produce it: the content
     // route has only ever served a PDF.
     contentAsHtml: false,
+    // The same endpoint answering 200 with nothing in it — a gateway that
+    // truncates, or a 204, which looks identical from here because a raw fetch
+    // reads the body before anyone looks at the status. It is the one answer
+    // the signature check above cannot catch, because that check flags a bad
+    // answer by its LENGTH and zero is a falsy length, so an empty body was
+    // saved and reported as a letter with `bytes: 0` beside it.
+    contentEmpty: false,
     // One folder that cannot be listed while its neighbours can. The archive
     // listing carries no folder field, so membership is derived by asking each
     // folder what it holds — and when one of those calls fails, the documents
@@ -185,6 +192,7 @@ export function start() {
       // download that fetched the wrong one was indistinguishable from a
       // correct one.
       if (tail === '/content') {
+        if (state.contentEmpty) return send(200, Buffer.alloc(0), 'application/pdf');
         if (state.contentAsHtml) return send(200, '<html><body>gateway error</body></html>', 'text/html');
         return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
       }

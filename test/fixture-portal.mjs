@@ -93,7 +93,17 @@ export function start() {
   // reads as proof that the archive was committed, and that state is also what
   // a sheet which never opened looks like. Nothing here could produce it, so
   // the guard could not be caught agreeing with a page it had never seen.
-  const state = { stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false, loginFlow: false, loginEmails: [] };
+  // commitDelayMs / createDelayMs: the portal takes its time. It has ACCEPTED
+  // the sheet — the entry is recorded straight away — but the page it is
+  // waiting on has not repainted yet, so the dialog is still standing when a
+  // fixed sleep runs out. That is the only difference between a slow portal and
+  // a refusing one, and two of the three two-step flows decide between them
+  // with a flat waitForTimeout, so a move that had gone through came back as
+  // "refused, nothing was changed". Nothing here could be slow before.
+  const state = {
+    stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false,
+    loginFlow: false, loginEmails: [], commitDelayMs: 0, createDelayMs: 0,
+  };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
 <body>
@@ -157,8 +167,10 @@ ${sheet()}
     const u = new URL(req.url, 'http://x');
     if (u.pathname === '/committed') {
       if (state.refuseCommit) { res.writeHead(409); return res.end(); }
+      // Recorded before the delay: the portal has taken the change, it is the
+      // page that has not caught up. See state.commitDelayMs.
       state.stored.push({ i: Number(u.searchParams.get('i')), folders: (u.searchParams.get('f') || '').split('|') });
-      res.writeHead(204); return res.end();
+      return setTimeout(() => { res.writeHead(204); res.end(); }, state.commitDelayMs);
     }
     if (u.pathname === '/created') {
       const n = u.searchParams.get('n');
@@ -168,7 +180,7 @@ ${sheet()}
       // for "folder exists", which the next store call then cannot find.
       if (state.created.includes(n)) { res.writeHead(409); return res.end(); }
       state.created.push(n);
-      res.writeHead(204); return res.end();
+      return setTimeout(() => { res.writeHead(204); res.end(); }, state.createDelayMs);
     }
     if (u.pathname === '/detail') {
       state.detailOpened.push(Number(u.searchParams.get('i')));
