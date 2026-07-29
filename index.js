@@ -371,6 +371,25 @@ function redact(s) {
   return out;
 }
 
+// A call that carries the letter id IN ITS URL came back empty-handed. withApi
+// keeps the two reasons for that apart on purpose — apiUnavailable is "the API
+// cannot be used at all", apiRefusal is the service being reached and answering
+// "not here" — and the tools below folded both into `needs the API`. So a
+// letter_id with a typo in it was reported as a broken transport, with the 404
+// that says otherwise sitting in the hint directly underneath, while
+// epost_settings in the same process went on reporting the API as working. That
+// is ed6806d's fix for the two folder-scoped Storage guards, applied to the
+// siblings nobody looked at; epost_get_letter, which was looked at, has named
+// both possibilities ever since. Only these: an id in the path is what makes a
+// 404 an answer ABOUT the letter, which it is not for the batch endpoints that
+// send their ids in a body.
+const apiEmptyHanded = subject => (apiUnavailable
+  ? { error: `${subject}: the API is unavailable`, hint: redact(apiUnavailable) }
+  : {
+    error: `${subject}: the service was reached and would not — most likely there is no such letter`,
+    hint: redact(apiRefusal || 'the service answered, but not with a result'),
+  });
+
 async function apiFetch(method, path, { params, form, json, token, raw } = {}) {
   const url = new URL(path, API_BASE);
   for (const [k, v] of Object.entries(params || {})) {
@@ -606,6 +625,24 @@ const apiLetterContent = id => withApi(t => apiFetch('GET', `/epost/v2/letters/$
 // allowed to sit behind a byte-order mark or a scrap of junk, and refusing a
 // real letter over that would be the opposite mistake.
 const looksLikePdf = b => b.subarray(0, 1024).toString('latin1').includes('%PDF-');
+
+// Why this answer must not be written down as the letter it is supposed to be —
+// or null when it may be. Both callers used to work that out for themselves and
+// both encoded it as the byte COUNT, a truthy length standing for "not a
+// letter". Zero is a falsy length, so the one answer with nothing in it at all
+// walked straight through the check written to stop exactly this kind of thing:
+// a gateway that truncates produces it, and so does a 204, which is
+// indistinguishable from here because a raw fetch reads the body before anyone
+// looks at the status. The result was an empty file reported as `saved` with
+// `bytes: 0` beside it, and nothing downstream can tell that from a letter that
+// arrived and happened to be short. The thumbnail endpoint has never had the
+// hole, because it reads the first four bytes rather than counting them — which
+// is the shape this restores: the answer decides, not its size.
+const contentProblem = b => (!b.length
+  ? 'the content endpoint answered with no bytes at all'
+  : !looksLikePdf(b)
+    ? `the content endpoint answered with ${b.length} bytes that are not a PDF — a gateway error page, most likely`
+    : null);
 
 const apiArchiveLetter = (id, directoryId) => withApi(t => apiFetch('PATCH', `/epost/v2/letters/${id}/archive`, {
   token: t, params: { 'destination-directory-id': directoryId || undefined },
@@ -884,10 +921,18 @@ async function createFolder(p, name) {
   const createBtn = p.locator('[id$=":create-btn"]').first();
   if (await createBtn.count()) await createBtn.click({ timeout: 8000, force: true });
   else await p.keyboard.press('Enter');
-  await p.waitForTimeout(2500);
   // Clicking is not creating. A duplicate name, or one the portal will not
   // accept, leaves the dialog open with its complaint in it — and this reported
   // a folder that does not exist, which the next store call then cannot find.
+  //
+  // Waited for rather than timed, for the same reason as the folder sheet in
+  // moveToFolder: read after a flat two and a half seconds, a portal that had
+  // created the folder and not yet closed its dialog was indistinguishable from
+  // one refusing the name — so the caller was told the folder does not exist
+  // while it does, and creating it again is exactly what the portal then
+  // refuses. The dialog having been open in the first place is established by
+  // the waitFor above, which throws rather than discarding its answer.
+  await input.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => {});
   if (await input.isVisible().catch(() => false)) {
     const why = await p.locator('[id*="folder"]').filter({ hasText: /already|exists|invalid|ung.ltig|vorhanden/i })
       .first().innerText().catch(() => '');
@@ -1022,13 +1067,26 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
       if ((await b.count()) && await b.isVisible().catch(() => false)) { await b.click({ timeout: 5000 }).catch(() => {}); break; }
     }
   }
-  await p.waitForTimeout(2500);
-
   // The portal refuses to commit an empty folder set, and it says so by simply
   // leaving the sheet open. Returning "moved" on that would tell the caller a
   // document had left a folder it is in fact still in — a wrong answer is worse
   // here than an error, because nothing downstream can tell the two apart.
+  //
+  // Waited for rather than timed, which is the other half of that and was
+  // missing: this read the sheet two and a half seconds after the click,
+  // whatever the page was doing, so a portal that had ACCEPTED the sheet and
+  // not yet repainted looked exactly like one refusing it. The document was in
+  // the folder, the caller was told it was not, and this then pressed Cancel on
+  // a sheet that was mid-commit. storeLetter — which drives this very sheet and
+  // took the signal from here — waits for it; the round that put it there wrote
+  // that "a portal taking its time over the commit is not a portal refusing it,
+  // and a flat sleep would turn the slow one into a wrong answer in the other
+  // direction", and left the flat sleep standing in the original. That the
+  // sheet was open to begin with is established above, by the tile lookup:
+  // boxFor only matches a container with an offsetParent, so a sheet that never
+  // opened is a "folder not offered" error rather than a false success here.
   const sheet = p.locator('[id*="storage-folder-selection"]').first();
+  await sheet.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => {});
   if (await sheet.isVisible().catch(() => false)) {
     const cancel = p.locator('[id$=":cancel"]').first();
     if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
@@ -1449,7 +1507,7 @@ const TOOLS = [
   { name: 'epost_list_letters', description: 'List the letters currently in the digital letterbox (index, id, sender, title, date, read). Over the API at most `limit` are returned and the reply says so when that window was filled.', inputSchema: { type: 'object', properties: { limit: { type: 'number', minimum: 1, description: 'how many to fetch over the API (default 200)' } } } },
   { name: 'epost_download_letter', description: 'Download one letter to output_dir, addressed by list index or by letter_id. Returns the saved path, written 0600: YYYY-MM-DD_ePost_<letter id>.pdf over the API, and _<index>.pdf over the portal fallback, which has no id to name it by — an index is a position in a list that renumbers itself after every store, so two calls a day apart can mean two different letters.', inputSchema: { type: 'object', properties: { index: { type: 'number', minimum: 0 }, letter_id: { type: 'string', description: 'instead of index; needs the public API' }, output_dir: { type: 'string' } }, required: ['output_dir'] } },
   { name: 'epost_download_all', description: 'Download every letter in the letterbox to output_dir. Returns the saved paths.', inputSchema: { type: 'object', properties: { output_dir: { type: 'string' } }, required: ['output_dir'] } },
-  { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string', description: 'API letter id (preferred — indices shift)' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
+  { name: 'epost_store_letter', description: 'Archive a letter into a Storage folder (the "Store" action): keeps the document, this is not a delete. A target folder is REQUIRED — Store opens a "Select a folder" sheet and will not commit without one. Address the letter by index in the inbox list, or by a text substring such as a date; indices shift after each store, so re-list between calls. A substring is matched against the first 200 letters and is refused when the inbox is longer than that, because a substring naming one letter in that window may name others past it.', inputSchema: { type: 'object', properties: { index: { type: 'number' }, title: { type: 'string' }, letter_id: { type: 'string', description: 'API letter id (preferred — indices shift)' }, folder: { type: 'string', description: 'existing Storage folder to file it into' } }, required: ['folder'] } },
   { name: 'epost_search', description: 'Full-text search across your letters — keywords are matched inside the letter content, not just the metadata. Optionally limit to the inbox or to Storage. API only; there is no equivalent in the portal automation.', inputSchema: { type: 'object', properties: { keyword: { type: 'string' }, location: { type: 'string', enum: ['ALL', 'INBOX', 'STORAGE'], description: 'default ALL' }, limit: { type: 'number' } }, required: ['keyword'] } },
   { name: 'epost_get_letter', description: 'Get one letter by its id, with the sender description, document types, dates and read status.', inputSchema: { type: 'object', properties: { letter_id: { type: 'string' } }, required: ['letter_id'] } },
   { name: 'epost_unread_count', description: 'How many unread letters are in the inbox.', inputSchema: { type: 'object', properties: {} } },
@@ -1617,8 +1675,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         // PORTAL can honour is a real second chance at the same document, and
         // that is the fall-through below; only the reason has to survive.
         const bytes = l ? await apiLetterContent(l.id) : null;
-        const notPdf = bytes && !looksLikePdf(bytes) ? bytes.length : 0;
-        if (bytes && !notPdf) {
+        const badContent = bytes ? contentProblem(bytes) : null;
+        if (bytes && !badContent) {
           mkdirSync(args.output_dir, { recursive: true });
           const stamp = (l.receivedDateTime || '').slice(0, 10) || 'undated';
           // Named after the LETTER, not after however the caller happened to
@@ -1650,7 +1708,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             ? {
               error: `the content of letter ${args.letter_id} could not be fetched`,
               hint: redact(apiWhy()
-                || (notPdf ? `the content endpoint answered with ${notPdf} bytes that are not a PDF — a gateway error page, most likely; nothing was saved`
+                || (badContent ? `${badContent}; nothing was saved`
                   : 'the API listed the inbox but would not serve the document')),
               note: 'the portal addresses letters by position and cannot be asked for an id — re-list and pass index instead',
             }
@@ -1710,6 +1768,27 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'address the letter by index or title to use the portal instead' });
         }
         if (letters) {
+          // A full window is not the whole inbox, and a substring is the one
+          // address that cannot be repaired past its edge. letterInWindow was
+          // written for the id on the next line: an id that is not in the page
+          // can be asked about directly, so the window stops mattering. A title
+          // goes to oneByTitle, whose whole job is to refuse to guess — it
+          // counts the matches and will not act on more than one, because "the
+          // first row containing this text" archives a neighbour just as
+          // readily as the intended letter. Counted inside a window, that count
+          // is not the letterbox's: a substring naming eleven letters, ten of
+          // them past the two hundred this asked for, was resolved as naming
+          // exactly one and that one was filed — while the very same substring
+          // against a short inbox is refused as ambiguous. There is no
+          // by-substring lookup to fall back on, so this says what it cannot
+          // establish rather than acting on a count it made up.
+          if (args.title && letters.length >= INBOX_WINDOW) {
+            return text({
+              error: `"${args.title}" cannot be resolved: the inbox is longer than the ${INBOX_WINDOW} letters this was matched against`,
+              hint: 'a substring naming one letter in that window may name others past it, and the wrong letter would be filed — use epost_search to find the letter and pass letter_id',
+              note: 'nothing was filed',
+            });
+          }
           // A full window is not the whole inbox — see letterInWindow.
           const l = args.letter_id ? await letterInWindow(letters, args.letter_id)
             : typeof args.index === 'number' ? letters[args.index]
@@ -1762,11 +1841,29 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             // like — so "it is still in the inbox" would be the same guess, one
             // layer down, that the rest of this round is about. Nothing was
             // filed by us is all that is known.
-            if (args.letter_id) {
+            //
+            // A service that ANSWERED no is answered here whatever the caller
+            // used to name the letter. Catching the rethrow so the tool could
+            // report it, and then reporting it only for letter_id, left an
+            // index or a title falling through to the portal exactly as before
+            // — which is the one thing withApi's rethrow exists to stop: "it
+            // would silently retry the operation through the browser, where it
+            // may do something subtly different, or hand the caller a fallback
+            // result for a request the service rejected". Both halves of that
+            // are live here. The portal numbers the letterbox its own way (the
+            // API listing asks for CLASSIC_LETTER in the inbox folder; the
+            // portal renders whatever cards there are), so index 0 there is not
+            // necessarily the letter the service just refused — it would go and
+            // archive a different one and report `status: ok`. The
+            // fall-through below stays for the case it was written for: a
+            // service that could not answer at all.
+            if (args.letter_id || refused) {
               return text({
-                error: `letter ${args.letter_id} could not be archived`,
+                error: `letter ${args.letter_id || l.id} could not be archived`,
                 hint: redact(refused?.message || apiWhy() || 'the API listed the inbox but would not file the letter'),
-                note: 'nothing was filed; the portal addresses letters by position and cannot be asked for an id — re-list and pass index or title instead',
+                note: refused
+                  ? 'nothing was filed; the service refused this outright, so it was not attempted a second way through the portal'
+                  : 'nothing was filed; the portal addresses letters by position and cannot be asked for an id — re-list and pass index or title instead',
               });
             }
           }
@@ -1826,7 +1923,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_restore_letter') {
       const ok = await apiRestoreLetter(args.letter_id);
-      return text(ok ? { transport: 'api', restored: args.letter_id } : { error: 'needs the API', hint: apiWhy() });
+      // A 404 here is the service saying it has no such letter — see
+      // apiEmptyHanded — and not the transport being unusable.
+      return text(ok ? { transport: 'api', restored: args.letter_id }
+        : apiEmptyHanded(`letter ${args.letter_id} was not restored`));
     }
     if (name === 'epost_delete_letter') {
       // Deleting is the one irreversible-ish action here, and it is never the
@@ -1836,7 +1936,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       }
       const ok = await apiDeleteLetter(args.letter_id);
       return text(ok ? { transport: 'api', deleted: args.letter_id, note: 'recoverable with epost_restore_letter until it expires from the trash' }
-        : { error: 'needs the API', hint: apiWhy() });
+        : apiEmptyHanded(`letter ${args.letter_id} was not deleted`));
     }
     if (name === 'epost_download_thumbnail') {
       // Checked before anything else touches it: dirname() on a number throws
@@ -1845,7 +1945,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         throw new Error(`output_path must be a path, not ${typeof args.output_path}`);
       }
       const bytes = await apiThumbnail(args.letter_id);
-      if (!bytes) return text({ error: 'needs the API', hint: apiWhy() });
+      if (!bytes) return text(apiEmptyHanded(`the thumbnail of letter ${args.letter_id} could not be fetched`));
       mkdirSync(dirname(args.output_path), { recursive: true });
       // Any 200 used to count. A portal or proxy that answers with JSON or an
       // HTML error page was saved under the name of a thumbnail and reported as
@@ -1971,6 +2071,21 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       }
       if (arch) {
         const items = Array.isArray(arch) ? arch : (arch.letters || arch.content || []);
+        // The same edge as one listing up, and the same substring problem: the
+        // not-found answer below learned that a page which came back exactly
+        // full proves nothing about what lies past it, and the title resolved
+        // against that page did not. oneByTitle refuses to act on more than one
+        // match — Storage cards show little but a date, and dates repeat — so
+        // counting the matches in a window turns that refusal into a guess: a
+        // substring naming eleven documents, ten of them past the window, came
+        // back as the one inside it. An id can be looked for again past the
+        // edge; a substring cannot, and here the caller has a limit to raise.
+        if (args.title && items.length >= limit) {
+          return text({
+            error: `"${args.title}" cannot be resolved: Storage is longer than the ${limit} documents this was matched against`,
+            hint: `a substring naming one document in that window may name others past it — raise limit above ${limit}, or address the document by letter_id`,
+          });
+        }
         const l = args.letter_id ? items.find(x => x.id === args.letter_id)
           : typeof args.index === 'number' ? items[args.index]
             : args.title ? oneByTitle(items, args.title) : null;
@@ -2017,15 +2132,15 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           // that index moved whatever happened to be first instead.
           const pos = items.indexOf(l);
           let saved = null;
-          let notPdf = 0;
+          let badContent = null;
           if (args.output_dir) {
             const bytes = await apiLetterContent(l.id);
-            // A 200 is not a document — see looksLikePdf. This path has no
+            // A 200 is not a document — see contentProblem. This path has no
             // portal fallback once the id has resolved, so an answer that is
             // not a PDF is simply not saved and the read half is reported on
             // its own, exactly as a content call that failed outright already is.
-            if (bytes && !looksLikePdf(bytes)) notPdf = bytes.length;
-            if (bytes && !notPdf) {
+            if (bytes) badContent = contentProblem(bytes);
+            if (bytes && !badContent) {
               mkdirSync(args.output_dir, { recursive: true });
               // Named after the document, not after however the caller happened
               // to address it. `index` means a position in the listing this
@@ -2047,8 +2162,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           if (args.output_dir && !saved) {
             return text({
               transport: 'api', status: 'partial', ...apiLetterRow(l, pos), saved: null,
-              error: notPdf
-                ? `the content endpoint answered with ${notPdf} bytes that are not a PDF — a gateway error page, most likely; the metadata below was read, the file was not saved`
+              error: badContent
+                ? `${badContent}; the metadata below was read, the file was not saved`
                 : 'the document content could not be fetched — the metadata below was read, the file was not saved',
             });
           }
