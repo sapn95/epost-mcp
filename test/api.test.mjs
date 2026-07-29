@@ -1,6 +1,6 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { start, TOKEN, API_KEY } from './mock-epost.mjs';
@@ -255,15 +255,27 @@ describe('archiving', () => {
       `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
   });
 
-  test('marks letters read, and only the ones asked for', async () => {
+  test('marks letters read, and counts what was sent rather than what was found', async () => {
     // The mock used to answer 204 to anything and change nothing, so this
     // passed on the tool's own echo of its arguments.
     const other = mock.state.inbox.find(l => l.id !== 'inbox-1');
     const before = other.readStatus;
     const { data } = await srv.call('epost_set_read_status', { letter_ids: ['inbox-1'], status: 'READ' });
-    assert.equal(data.updated, 1);
+    assert.equal(data.accepted, 1);
     assert.equal(mock.state.inbox.find(l => l.id === 'inbox-1').readStatus, 'READ', 'the letter did not change');
     assert.equal(other.readStatus, before, 'a letter nobody named changed too');
+
+    // `updated: N` was N read straight off the arguments. The endpoint answers
+    // 204 with an empty body and never names the ids it recognised, so three
+    // ids of which one exists came back as three letters updated — a number
+    // that was true before the call was made.
+    const many = await srv.call('epost_set_read_status', {
+      letter_ids: ['inbox-1', 'no-such-letter', 'also-not-a-letter'], status: 'READ',
+    });
+    assert.ok(!('updated' in many.data),
+      `a count the service never gave is reported as one: ${JSON.stringify(many.data)}`);
+    assert.equal(many.data.accepted, 3);
+    assert.match(many.data.note, /what was sent/, 'and it says which of the two that number is');
   });
 
   test('restores a deleted letter, and the trash gives it up', async () => {
@@ -488,6 +500,35 @@ describe('the API answering no', () => {
     m.state.thumbnailAsHtml = false;
     assert.match(data.error, /did not answer with an image/);
     assert.ok(!existsSync(path), 'an error page was saved under the name of a thumbnail');
+  });
+
+  test('an error page is not a letter, and is not saved as one', async () => {
+    // The thumbnail endpoint was taught this two rounds ago, after a gateway
+    // that answers with an HTML page had one written under a .png name and
+    // reported as an image. The endpoint that serves the correspondence itself
+    // never learned it: thirty-nine bytes of "<html><body>gateway error" landed
+    // in the caller's archive as 2020-02-02_ePost_inbox-1.pdf, reported as
+    // saved with a byte count beside it, and nothing downstream could tell.
+    const bad = mkdtempSync(join(tmpdir(), 'epost-notapdf-'));
+    m.state.contentAsHtml = true;
+    try {
+      const { data, raw } = await s.call('epost_download_letter', { letter_id: 'inbox-1', output_dir: bad });
+      assert.ok(!data.saved, `an error page was saved as a letter: ${raw.slice(0, 200)}`);
+      assert.match(data.error, /content of letter inbox-1 could not be fetched/);
+      assert.match(data.hint, /not a PDF/, `it does not say what came back instead: ${raw.slice(0, 200)}`);
+      assert.deepEqual(readdirSync(bad), [], 'something was written regardless');
+
+      // Same endpoint, other tool, and no portal to fall back to once the id
+      // has resolved: the half that was read is reported, the file is not.
+      const doc = await s.call('epost_read_storage_document', { letter_id: 'arch-1', output_dir: bad });
+      assert.equal(doc.data.status, 'partial', `a document was reported as saved: ${doc.raw.slice(0, 200)}`);
+      assert.equal(doc.data.saved, null);
+      assert.match(doc.data.error, /not a PDF/);
+      assert.equal(doc.data.id, 'arch-1', 'the metadata half is still reported');
+      assert.deepEqual(readdirSync(bad), []);
+    } finally {
+      m.state.contentAsHtml = false;
+    }
   });
 
   test('a document that is not in Storage is reported as missing, not looked for elsewhere', async () => {
@@ -801,6 +842,105 @@ describe('an inbox longer than one listing', () => {
     const { data } = await s.call('epost_store_letter', { letter_id: 'no-such-letter', folder: 'Example_Alpha' });
     assert.match(data.error, /no letter no-such-letter in the inbox/);
     assert.match(data.hint, /epost_list_storage_documents/);
+  });
+
+  test('a letter the service says is already archived is answered, not thrown', async () => {
+    // The second lookup is not scoped to the inbox: it asks the service about
+    // one id and the service answers about letters wherever they are. So a
+    // letter that left the inbox weeks ago resolves here on any inbox long
+    // enough to fill the window — bulk-299 was archived by the first test in
+    // this block — and the archive call is what refuses it, in the service's
+    // own words. withApi rethrows a 4xx precisely so the tool can report it,
+    // and nobody did: it left through the outer catch as `ERROR: PATCH
+    // /epost/v2/letters/…/archive -> 400 {"error":"bad_request",…}`, a raw
+    // upstream body where the very same question against a SHORT inbox gets
+    // the guard's own sentence. One question, one answer.
+    assert.ok(m.state.archive.some(l => l.id === 'bulk-299'), 'the block above is supposed to have archived it');
+    const { data, raw, isError } = await s.call('epost_store_letter', { letter_id: 'bulk-299', folder: 'Example_Alpha' });
+    assert.ok(!isError, `the service's refusal escaped unhandled: ${raw.slice(0, 200)}`);
+    assert.match(data.error, /letter bulk-299 could not be archived/, raw.slice(0, 200));
+    assert.match(data.hint, /already archived/i, "the service's own words are passed on");
+    assert.match(data.note, /nothing was filed/);
+  });
+});
+
+// The same window one listing up. Storage is a listing too, and the tool that
+// resolves a document against it read the edge of its page as the edge of the
+// archive — the defect the block above fixed for the inbox, in the sibling that
+// was not looked at.
+describe('an archive longer than one listing', () => {
+  let m, s;
+  before(async () => {
+    m = await start();
+    // Past the 1000 the Storage tools ask for, so the listing comes back
+    // exactly full and the document being asked about sits beyond it. The last
+    // of them is filed, so it is emphatically in Storage and in a folder.
+    const proto = JSON.parse(JSON.stringify(m.state.archive[0]));
+    for (let i = 0; i < 1200; i++) m.state.archive.push({ ...proto, id: `bulk-${i}`, fileName: `bulk-${i}.pdf` });
+    m.state.inFolder['dir-one'].push('bulk-1199');
+    s = await startServer({ EPOST_API_BASE: m.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { s?.stop(); await m?.close(); });
+
+  test('a document past the window is not reported as one that is not in Storage', async () => {
+    const { data, raw } = await s.call('epost_read_storage_document', { letter_id: 'bulk-1199' });
+    assert.doesNotMatch(raw, /no such document in Storage/,
+      `a document sitting in Storage was reported as not being there: ${raw.slice(0, 200)}`);
+    assert.match(data.error, /first 1000 of Storage/, raw.slice(0, 200));
+    assert.match(data.hint, /raise limit/, 'and says what would reach it');
+  });
+
+  test('and raising the limit reaches it, folder and all', async () => {
+    // The limit has to travel into the membership lookup as well: that one
+    // asks each folder what it holds, and it was pinned to 1000 of its own.
+    const { data, raw } = await s.call('epost_read_storage_document', { letter_id: 'bulk-1199', limit: 2000 });
+    assert.equal(data.id, 'bulk-1199', `still out of reach: ${raw.slice(0, 200)}`);
+    assert.deepEqual(data.storedIn, ['Example_Alpha'], `no folder reported: ${JSON.stringify(data.storedIn)}`);
+  });
+
+  test('an id that really is nowhere is still answered plainly', async () => {
+    // A listing shorter than the window has answered the question, and hedging
+    // there would send every caller off to raise a limit for nothing.
+    const { data } = await s.call('epost_read_storage_document', { letter_id: 'no-such-doc', limit: 2000 });
+    assert.match(data.error, /no such document in Storage/);
+  });
+});
+
+// The inbox renumbers itself after every store, so the position a caller passed
+// is not a name.
+describe('naming a downloaded letter', () => {
+  let m, s, dir;
+  before(async () => {
+    m = await start();
+    dir = mkdtempSync(join(tmpdir(), 'epost-rename-'));
+    s = await startServer({ EPOST_API_BASE: m.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { s?.stop(); await m?.close(); });
+
+  test('two letters that were each index 0 are not one file', async () => {
+    // The saved name was assembled from the index the caller passed, and the
+    // tool's own description warns that indices shift after every store. So
+    // {index:0} before an archive and {index:0} after it are two DIFFERENT
+    // letters, and with the letterbox's usual crop of same-day dates they were
+    // assembled into one and the same path: the second call silently overwrote
+    // the file the first had just reported as its own. ed6806d fixed precisely
+    // this in epost_read_storage_document — "the id is the one thing that
+    // identifies exactly one document" — and left the sibling numbering.
+    const first = await s.call('epost_download_letter', { index: 0, output_dir: dir });
+    assert.ok(first.data.saved, `nothing saved: ${first.raw.slice(0, 160)}`);
+    assert.match(readFileSync(first.data.saved).toString(), /inbox-1/, 'it fetched a different letter');
+
+    await s.call('epost_store_letter', { letter_id: 'inbox-1', folder: 'Example_Alpha' });
+    assert.equal(m.state.inbox[0].id, 'inbox-2', 'the fixture is supposed to renumber the inbox');
+
+    const second = await s.call('epost_download_letter', { index: 0, output_dir: dir });
+    assert.ok(second.data.saved, `nothing saved: ${second.raw.slice(0, 160)}`);
+    assert.notEqual(first.data.saved, second.data.saved,
+      `two different letters were saved to one path: ${second.data.saved}`);
+    // The id is in the bytes, so a file holding the wrong letter is visible.
+    assert.match(readFileSync(first.data.saved).toString(), /inbox-1/,
+      'the first file now holds the second letter');
+    assert.match(readFileSync(second.data.saved).toString(), /inbox-2/);
   });
 });
 

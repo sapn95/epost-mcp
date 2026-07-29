@@ -85,7 +85,15 @@ export function start() {
   // duplicate folder name — and nothing here could produce that before, so the
   // half of the store flow that has to notice went untested while it reported
   // every letter as archived.
-  const state = { stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, loginFlow: false, loginEmails: [] };
+  //
+  // sheetStuck: the menu item is clicked and the sheet does not open. A stale
+  // view, a lapsed session, a re-render that replaced the handler — the overlay
+  // is in the DOM the whole time either way, hidden, exactly as PrimeFaces
+  // builds it. It matters because "the sheet is not showing" is what the store
+  // reads as proof that the archive was committed, and that state is also what
+  // a sheet which never opened looks like. Nothing here could produce it, so
+  // the guard could not be caught agreeing with a page it had never seen.
+  const state = { stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false, loginFlow: false, loginEmails: [] };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
 <body>
@@ -93,6 +101,8 @@ export function start() {
 ${body}
 ${sheet()}
 <script>
+  // Read at render time, so a test flips it and the next reload gets it.
+  const SHEET_STUCK = ${state.sheetStuck};
   let current = null;
   function store(i){
     current = i;
@@ -105,7 +115,11 @@ ${sheet()}
       const name = c.querySelector('span').textContent;
       c.querySelector('.ui-chkbox-box').classList.toggle('ui-state-active', owned.includes(name));
     });
-    document.getElementById('storage-folder-selection').style.display='block';
+    // The sheet is prepared either way and only then shown, so a stuck one
+    // leaves ticked checkboxes standing in a DOM nobody can see — which is
+    // exactly what let a tile lookup that ignores visibility carry on
+    // regardless. See state.sheetStuck.
+    if (!SHEET_STUCK) document.getElementById('storage-folder-selection').style.display='block';
   }
   function closeSheet(){ document.getElementById('storage-folder-selection').style.display='none'; }
   function commit(){
