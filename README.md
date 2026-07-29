@@ -247,10 +247,10 @@ Or add it directly to `~/.claude.json`:
 | `epost_status` | — | `{ status: "ok" \| "login_required" }` |
 | `epost_login` | `wait_seconds` (optional, default 300) | Opens a visible window and drives the SwissID chain up to the Touch ID prompt. `{ status, browser, message }` |
 | `epost_settings` | — | Resolved browser + why, Touch ID capability, paths, whether the account e-mail is set |
-| `epost_list_letters` | — | Array of `{ index, sender, title, dates, preview }` (newest first) |
-| `epost_download_letter` | `index` (number), `output_dir` (string) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf` |
+| `epost_list_letters` | `limit` (optional, API only) | `{ transport, count, letters[] }`, newest first. Over the API a letter carries `id`, a real `sender` description, `documentTypes` and `read`; over the browser fallback `sender`, `title`, `date`, `dates` and a `preview`. `truncated: true` when the window was filled |
+| `epost_download_letter` | `output_dir` (required); `index` **or** `letter_id` (API only) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf`, written `0600` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |
-| `epost_store_letter` | `folder` (required); `index` or `title` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` |
+| `epost_store_letter` | `folder` (required); exactly one of `index`, `title`, `letter_id` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` |
 | `epost_search` | `keyword`; `location` (`ALL`\|`INBOX`\|`STORAGE`), `limit` | **Full-text search inside the letters.** API only — the portal offers nothing like it. |
 | `epost_get_letter` | `letter_id` | One letter: sender description, document types, dates, read status |
 | `epost_unread_count` | — | `{ unread }` |
@@ -259,9 +259,9 @@ Or add it directly to `~/.claude.json`:
 | `epost_restore_letter` | `letter_id` | Restore a deleted letter to the inbox |
 | `epost_delete_letter` | `letter_id`, `confirm: true` | ⚠️ Moves a letter to the trash. Gated behind `confirm`; to file something away use `epost_store_letter` instead |
 | `epost_download_thumbnail` | `letter_id`, `output_path` | Thumbnail image — eyeball a document without fetching the PDF |
-| `epost_list_storage` | — | `{ folders: [{ name, count }], myDocuments, url }` — your **Custom** folders + the My-Documents count |
-| `epost_list_storage_documents` | `scroll_all` (bool, optional) | `{ count, documents: [{ index, date, storedIn, preview }] }` — pass `scroll_all:true` to lazy-load every card |
-| `epost_read_storage_document` | `index` or `title`; `output_dir` (optional) | Opens one Storage document: real sender/subject, document type, date, amount, folder — and saves the PDF when `output_dir` is given. The only way to classify an archived document, since the card list only ever says "Gescannter Brief". |
+| `epost_list_storage` | — | `{ folders[], companyFolders[] }` — your **Custom** folders kept apart from the branded ones the service maintains, which the move sheet will never accept as a destination. Over the API a folder carries its `id`; the browser fallback adds `myDocuments` and `url` |
+| `epost_list_storage_documents` | `folder_id`, `limit` (API only); `scroll_all` (browser) | `{ transport, count, documents[] }`. `storedIn` is the folders a document is in, `null` when it is in none, and **absent when membership could not be established** — three different answers. `scroll_all:true` lazy-loads every card on the browser path |
+| `epost_read_storage_document` | `index`, `title`, or `letter_id`/`folder_id` (API only); `output_dir` (optional) | Opens one Storage document: real sender/subject, document type, date, amount, folder — and saves the PDF when `output_dir` is given. The only way to classify an archived document, since the card list only ever says "Gescannter Brief". |
 | `epost_create_folder` | `name` (string) | `{ created }` |
 | `epost_move_to_folder` | `folder` (required); `index` or `title`; `remove_from` (optional) | Files a Storage document into a folder. `remove_from` unticks the old folder in the same sheet — the only way to empty one. |
 | `epost_unfile_from_folder` | `folder` (required); `index` or `title` | Removes a folder membership. Only works while the document is in more than one folder (see below). |
@@ -310,12 +310,22 @@ never removes an existing membership. Two consequences worth knowing:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `EPOST_STATE` | `~/.epost-mcp/state.json` | Cached session (storageState). **Secret.** |
-| `EPOST_CHROMIUM` | auto-detect | Path to the Chromium executable to drive |
+| `EPOST_TRANSPORT` | `auto` | `auto` \| `api` \| `browser`. A pin is enforced both ways: pinned to `api`, a browser-only tool is refused rather than quietly redirected |
+| `EPOST_API_PASSWORD` | keychain `epost-mcp-api-password` | Password for the password grant. **Secret.** |
+| `EPOST_API_KEY` | keychain `epost-mcp-api-key` | Sent as `X-API-KEY`, instead of or alongside the password. **Secret.** |
+| `EPOST_SWISSID_USER` | keychain `epost-mcp-swissid-user` | Account e-mail: the API username, and what the login fills in |
+| `EPOST_BROWSER` | first signed system browser found | `chrome` \| `chrome-canary` \| `edge` \| `brave` \| `chromium` \| absolute path. `EPOST_CHROMIUM` is accepted as the older name for it |
+| `EPOST_STATE` | `~/.epost-mcp/state.json` | Cached session (storageState). **Secret**, written `0600` |
+| `EPOST_PROFILE` | `~/.epost-mcp/profile` | Persistent browser profile. It holds the same session in Chromium's own store, so it is **just as secret**; created `0700` |
+| `EPOST_API_BASE` | `https://api.epost.ch` | API host — overridable for tests |
+| `EPOST_APP_URL` | `https://app.epost.ch` | Portal base — overridable for tests |
+| `EPOST_DEBUG` | unset | `1` traces the login steps on stderr |
 
-The Chromium path is auto-detected from the Playwright cache
-(`~/Library/Caches/ms-playwright/chromium-*`). Set `EPOST_CHROMIUM` only if
-auto-detection fails.
+The browser is resolved in that order deliberately: an installed, signed browser
+first, because only that one can reach the platform authenticator, and only then
+Playwright's own Chromium and the Playwright cache
+(`~/Library/Caches/ms-playwright/chromium-*`). `epost_settings` reports which was
+chosen and why.
 
 ## Troubleshooting
 
@@ -340,8 +350,13 @@ auto-detection fails.
 
 ## How it works (internals)
 
-1. `chromium.launch({ headless })` + `browser.newContext({ storageState })` load
-   the cached cookies. `acceptDownloads: true`, `locale: 'de-CH'`.
+1. `chromium.launchPersistentContext(EPOST_PROFILE, …)` with
+   `acceptDownloads: true` and `locale: 'de-CH'`, and the cookies from
+   `state.json` are then added on top. Both halves are needed: the profile keeps
+   what a fresh context throws away, notably SwissID's "this device is known"
+   state, while `state.json` keeps the session cookies, which a persistent
+   profile drops when the browser closes. Running on `storageState` alone is
+   what made every expiry cost the full two-factor dance again.
 2. Navigating to `app.epost.ch` follows the KLARA/SwissID SSO redirect chain onto
    the dashboard (or a visible login form if the session died).
 3. The letterbox is opened by clicking the **Digital Letterbox** label

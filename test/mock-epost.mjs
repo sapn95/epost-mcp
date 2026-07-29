@@ -65,6 +65,14 @@ export function start() {
     // A gateway that answers a thumbnail request with an error PAGE, 200 and
     // all. Any 200 used to be saved under the thumbnail's name.
     thumbnailAsHtml: false,
+    // One folder that cannot be listed while its neighbours can. The archive
+    // listing carries no folder field, so membership is derived by asking each
+    // folder what it holds — and when one of those calls fails, the documents
+    // it would have named have an UNKNOWN membership rather than none. Nothing
+    // could produce that here before, so the branch that distinguishes the two
+    // went untested. forceStatus cannot express it: every folder listing uses
+    // the same path, so a queued failure lands on whichever call comes first.
+    failDirectoryId: null,
   };
 
   const srv = createServer((req, res) => {
@@ -140,6 +148,7 @@ export function start() {
     if (p === '/epost/v2/archives/directories') return send(200, DIRECTORIES);
     if (p === '/epost/v2/archives/letters') {
       const d = url.searchParams.get('directory-id');
+      if (d && d === state.failDirectoryId) return send(503, { error: 'directory_unavailable' });
       if (d) return send(200, state.archive.filter(l => (state.inFolder[d] || []).includes(l.id)));
       return send(200, state.archive);           // note: no folder field, like the real one
     }

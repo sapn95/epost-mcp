@@ -61,8 +61,26 @@ const sheet = () => `
   <button id="f:moveBtn" onclick="commit()">Store</button>
 </div>`;
 
+// The one step of the SwissID chain that can be reproduced without SwissID: a
+// login form whose input is not in the DOM when the redirect lands. The real
+// page renders it a beat later, which is the whole reason the assisted login is
+// supposed to look more than once. Served only while state.loginFlow is on, so
+// the tests that want the dashboard still get one.
+const LOGIN_FIELD_DELAY = 3000;
+const loginEmailPage = () => `<!doctype html><html><head><meta charset="utf-8"><title>login-email</title></head>
+<body><h1>SwissID</h1><div id="form"></div>
+<script>
+  setTimeout(function () {
+    document.getElementById('form').innerHTML = '<input type="email" id="u"><button id="w">Weiter</button>';
+    document.getElementById('w').onclick = function () {
+      fetch('/login-email-submitted?v=' + encodeURIComponent(document.getElementById('u').value));
+    };
+  }, ${LOGIN_FIELD_DELAY});
+</script>
+</body></html>`;
+
 export function start() {
-  const state = { stored: [], moved: [], detailOpened: [], created: [] };
+  const state = { stored: [], moved: [], detailOpened: [], created: [], loginFlow: false, loginEmails: [] };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
 <body>
@@ -131,6 +149,19 @@ ${sheet()}
     if (u.pathname === '/detail') {
       state.detailOpened.push(Number(u.searchParams.get('i')));
       res.writeHead(204); return res.end();
+    }
+    if (u.pathname === '/login-email-submitted') {
+      state.loginEmails.push(u.searchParams.get('v'));
+      res.writeHead(204); return res.end();
+    }
+    if (u.pathname === '/login-email') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(loginEmailPage());
+    }
+    // The portal bounces an unauthenticated visitor into the login chain. The
+    // path is what the automation matches on, so a local fixture can stand in.
+    if (state.loginFlow && u.pathname === '/') {
+      res.writeHead(302, { Location: '/login-email' }); return res.end();
     }
     const isStorage = u.pathname.includes('LetterStorage');
     const body = isStorage

@@ -28,7 +28,7 @@ const AWS_KEY = 'AKIA' + 'Q'.repeat(16);
 const gitIn = dir => (...a) => spawnSync('git', a, { cwd: dir, env: GIT_ENV, encoding: 'utf8' });
 
 function repo(files) {
-  const dir = mkdtempSync(join(tmpdir(), 'pingen-hygiene-'));
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-hygiene-'));
   const git = gitIn(dir);
   git('init', '-q');
   // example.com is one of the addresses the scan accepts as identifying nobody,
@@ -41,12 +41,13 @@ function repo(files) {
   return dir;
 }
 
-function scan(dir) {
+function scan(dir, denylist = join(dir, 'no-such-denylist')) {
   const r = spawnSync(process.execPath, [SCAN], {
     cwd: dir, encoding: 'utf8',
-    // A denylist path that cannot exist: the scan must not read the developer's
-    // real one, and no test may depend on whether they keep one.
-    env: { ...GIT_ENV, HYGIENE_DENYLIST: join(dir, 'no-such-denylist') },
+    // A denylist path that cannot exist unless a test asks for one: the scan
+    // must not read the developer's real list, and no test may depend on
+    // whether they keep one.
+    env: { ...GIT_ENV, HYGIENE_DENYLIST: denylist },
   });
   return { code: r.status, out: `${r.stdout}${r.stderr}` };
 }
@@ -81,6 +82,104 @@ describe('the hygiene scan', () => {
     const { code, out } = scan(repo({ '.env.bücher': 'PINGEN_CLIENT_SECRET=hunter2\n' }));
     assert.equal(code, 1, `a tracked .env file slipped through:\n${out}`);
     assert.match(out, /session\/credential file is tracked/);
+  });
+
+  test('a path whose bytes are not valid UTF-8 is still scanned', () => {
+    // Reading the list NUL-separated stopped git escaping the name, but not the
+    // decoding: execFileSync reads git's raw bytes as UTF-8, so a Latin-1 file
+    // name out of a repository written on Linux still arrived with a
+    // replacement character in it, and every read then went looking for a name
+    // no file has ever had. Both throws were swallowed, the file was skipped
+    // without a word, and the summary counted it among the clean ones while an
+    // access key sat staged inside it.
+    const dir = repo({ 'readme.md': 'nothing of interest here\n' });
+    const git = gitIn(dir);
+    writeFileSync(join(dir, 'loose'), `key = ${AWS_KEY}\n`);
+    const sha = git('hash-object', '-w', join(dir, 'loose')).stdout.trim();
+    // Staged directly, because macOS will not create the file: APFS rejects a
+    // name that is not valid UTF-8 with EILSEQ. The index takes it regardless,
+    // and the index is what gets committed and pushed.
+    git('rm', '-q', '--cached', 'loose');
+    const entry = Buffer.concat([
+      Buffer.from(`100644 ${sha} 0\t`, 'latin1'),
+      Buffer.from([0x62, 0xfc, 0x63, 0x68, 0x65, 0x72, 0x2e, 0x74, 0x78, 0x74]),  // b<0xfc>cher.txt
+      Buffer.from([0]),
+    ]);
+    spawnSync('git', ['update-index', '-z', '--index-info'], { cwd: dir, env: GIT_ENV, input: entry });
+
+    const { code, out } = scan(dir);
+    assert.equal(code, 1, `a byte git cannot spell hid a credential from the scan:\n${out}`);
+    assert.match(out, /AWS access key/);
+  });
+
+  test('a finding names the line of the copy it is in', () => {
+    // Both copies used to be glued together and scanned as one string, so the
+    // line number was counted through the join: a key on line 4 of a four-line
+    // working copy was announced at line 45, which reads like a scanner that
+    // has lost its place and gets waved through as a false positive.
+    const dir = repo({ 'notes.txt': `${Array.from({ length: 40 }, (_, i) => `line ${i + 1} clean`).join('\n')}\n` });
+    writeFileSync(join(dir, 'notes.txt'), `one\ntwo\nthree\nkey = ${AWS_KEY}\n`);
+    const { code, out } = scan(dir);
+    assert.equal(code, 1, out);
+    assert.match(out, /notes\.txt[^:\n]*:4: AWS access key/, `pointed at a line the file does not reach:\n${out}`);
+  });
+
+  test('an address belonging to somebody is a finding, an SSH remote is not', () => {
+    // This is the rule that cannot be written down as a list, so it works the
+    // other way round: everything that is not one of the reserved example
+    // domains counts. `git@github.com:owner/repo` is a remote rather than a
+    // person, and reporting it would teach the reader to wave the whole check
+    // through.
+    // Assembled, never written down — for the same reason AWS_KEY is. Spelled
+    // out here, this file would be a tracked file with somebody's address in
+    // it, and the scan would be quite right to fail on it.
+    const LOCAL = 'a.person', DOMAIN = 'some-provider' + '.ch';
+    const dir = repo({
+      'remote.txt': 'git' + '@github.com:someone/somewhere.git\n',
+      'notes.txt': `reply came back from ${LOCAL}@${DOMAIN} instead\n`,
+    });
+    const { code, out } = scan(dir);
+    assert.equal(code, 1, out);
+    assert.ok(out.includes(`email address at @${DOMAIN}`), `the domain is what says where to look:\n${out}`);
+    // Same rule as for a secret: the finding says where to look, not what it is.
+    assert.ok(!out.includes(LOCAL), `the address was echoed into the report:\n${out}`);
+    assert.ok(!/github\.com/.test(out), `an SSH remote was read as somebody's address:\n${out}`);
+  });
+
+  test('a denylisted name is caught in either normalisation', () => {
+    // The terms that identify the author cannot live in this repository, so the
+    // list is read from outside it. The names that leaked the first time came
+    // out of the service in NFD — a umlaut written as a plus a combining
+    // diaeresis — and a byte-exact search walked straight past them.
+    const list = join(mkdtempSync(join(tmpdir(), 'mcp-denylist-')), 'denylist.txt');
+    writeFileSync(list, '# a comment, and a blank line follow\n\nSchnürkli\n');
+    // Written out decomposed on purpose, and not by hand: an editor would
+    // normalise it back the moment the file was saved.
+    const decomposed = 'Schn' + '\u0075\u0308' + 'rkli';
+    assert.equal(decomposed.length, 10, 'the fixture is meant to be NFD');
+    const dir = repo({ 'notes.txt': `Absender: ${decomposed} AG\n` });
+    const { code, out } = scan(dir, list);
+    assert.equal(code, 1, `NFD walked past the list:\n${out}`);
+    assert.match(out, /denylisted term \(9 chars\)/);
+    assert.ok(!out.includes('chn'), `the term was echoed into the report:\n${out}`);
+  });
+
+  test('a tracked path that yields no readable copy at all is a failure', () => {
+    // Every miss this scan has had took the same shape: a path it could not
+    // open, both reads throwing, both throws swallowed, and the summary going
+    // on to call the repository clean. Whatever the reason turns out to be next
+    // time, not having scanned something is not the same as having found
+    // nothing in it.
+    const dir = repo({ 'readme.md': 'nothing of interest here\n' });
+    const git = gitIn(dir);
+    // An index entry pointing at an object that is not in the repository, and
+    // nothing of that name on disk either — the state a partial clone or a
+    // pruned object store leaves behind.
+    const missing = 'e'.repeat(40);
+    git('update-index', '--add', '--cacheinfo', `100644,${missing},ghost.txt`);
+    const { code, out } = scan(dir);
+    assert.equal(code, 1, `it was skipped in silence:\n${out}`);
+    assert.match(out, /ghost\.txt: tracked, but no copy of it could be read/);
   });
 
   test('scans the working tree during an unfinished merge, and quietly', () => {
