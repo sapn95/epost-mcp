@@ -250,7 +250,7 @@ Or add it directly to `~/.claude.json`:
 | `epost_list_letters` | `limit` (optional, API only) | `{ transport, count, letters[] }`, newest first. Over the API a letter carries `id`, a real `sender` description, `documentTypes` and `read`; over the browser fallback `sender`, `title`, `date`, `dates` and a `preview`. `truncated: true` when the window was filled |
 | `epost_download_letter` | `output_dir` (required); `index` **or** `letter_id` (API only) | `{ saved }` — path of the saved `YYYY-MM-DD_ePost_<index>.pdf`, written `0600` |
 | `epost_download_all` | `output_dir` (string) | `{ count, saved[] }` — every letter downloaded |
-| `epost_store_letter` | `folder` (required); exactly one of `index`, `title`, `letter_id` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` |
+| `epost_store_letter` | `folder` (required); exactly one of `index`, `title`, `letter_id` | **Archive**: takes the letter out of the inbox into that Storage folder. Not a delete. `{ stored, folder }` — or `{ status: "refused" }` when the portal would not accept the folder sheet, which it signals by leaving it open and nothing else |
 | `epost_search` | `keyword`; `location` (`ALL`\|`INBOX`\|`STORAGE`), `limit` | **Full-text search inside the letters.** API only — the portal offers nothing like it. |
 | `epost_get_letter` | `letter_id` | One letter: sender description, document types, dates, read status |
 | `epost_unread_count` | — | `{ unread }` |

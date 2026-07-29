@@ -75,6 +75,28 @@ describe('portal automation', () => {
     assert.match(msg, /Example_Alpha/, 'the message lists the real options');
   });
 
+  test('a store the portal will not accept is refused, not reported as archived', SLOW, async () => {
+    // Clicking Store is not storing. The portal says no the only way it ever
+    // says anything about a sheet — by leaving it standing — and nothing below
+    // the click ever looked at the page again. The click's own failure has to be
+    // swallowed, because Playwright throws at the settle timeout over a click
+    // that landed perfectly well, so the evidence for "archived" was that a line
+    // of code had run: `status: ok` with the letter still in the inbox and an
+    // open overlay left to swallow the next call's clicks. epost_move_to_folder
+    // drives this very sheet and has read the signal for two rounds.
+    const before = portal.state.stored.length;
+    portal.state.refuseCommit = true;
+    try {
+      const { data, raw } = await srv.call('epost_store_letter', { index: 0, folder: 'Example_Alpha' });
+      assert.equal(data.status, 'refused',
+        `a store that never happened was reported as done: ${raw.slice(0, 200)}`);
+      assert.match(data.hint, /nothing was filed/, 'it says plainly that the letter was not archived');
+      assert.equal(portal.state.stored.length, before, 'the sheet was committed after all');
+    } finally {
+      portal.state.refuseCommit = false;
+    }
+  });
+
   test('downloads a letter to disk', SLOW, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'epost-dl-'));
     const { data, raw } = await srv.call('epost_download_letter', { index: 0, output_dir: dir });

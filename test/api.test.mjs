@@ -110,6 +110,29 @@ describe('reading', () => {
     const { data } = await srv.call('epost_list_deleted');
     assert.equal(data.count, 1);
   });
+
+  test('a search hit is not a position in the inbox, and stops claiming to be one', async () => {
+    // `index` is the handle epost_download_letter and epost_store_letter take.
+    // Search numbered its own hits, so a keyword naming exactly one letter came
+    // back as index 0 for a letter sitting THIRD in the inbox — and a caller
+    // downloading the index it had just been handed saved the first letter's
+    // bytes under the name of the one it had searched for. epost_get_letter
+    // minted the same 0 for every letter in the letterbox, the trash included.
+    const listed = await srv.call('epost_list_letters');
+    assert.equal(listed.data.letters.find(l => l.id === 'inbox-3').index, 2,
+      'the fixture is supposed to put inbox-3 third');
+    const hit = await srv.call('epost_search', { keyword: 'inbox-3' });
+    assert.equal(hit.data.count, 1, 'the keyword is supposed to name exactly one letter');
+    assert.equal(hit.data.letters[0].id, 'inbox-3');
+    assert.ok(!('index' in hit.data.letters[0]),
+      `a hit was numbered as if it were an inbox position: ${JSON.stringify(hit.data.letters[0])}`);
+    const one = await srv.call('epost_get_letter', { letter_id: 'inbox-3' });
+    assert.equal(one.data.id, 'inbox-3');
+    assert.ok(!('index' in one.data),
+      `a single-letter lookup reported a position it never looked up: ${JSON.stringify(one.data.index)}`);
+    // The listing that does address by position keeps saying so.
+    assert.ok(listed.data.letters.every(l => typeof l.index === 'number'), 'a real listing lost its positions');
+  });
 });
 
 describe('downloads', () => {
@@ -700,6 +723,84 @@ describe('the API answering no', () => {
     assert.match(data.error, /letter_id needs the public API/);
     assert.match(data.note, /index or title/, 'it says what would work instead');
     assert.ok(!m.state.archive.some(l => l.id === 'inbox-1'), 'something was archived regardless');
+  });
+
+  test('an archive the service would not carry out is reported, not retried by position', async () => {
+    // Third door into the same room, and the last one still open: the folders
+    // came back, the id resolved, and the PATCH did not. Falling through from
+    // there hands an id to a portal that addresses letters by POSITION — so it
+    // gets the index nobody passed, after launching a browser to arrive at it.
+    // epost_download_letter had both of its doors shut two rounds ago; this
+    // tool only ever had the "no such id" one. Pinned to the API the same
+    // fall-through surfaces as a complaint about the pin, which says nothing
+    // about the letter that is still sitting in the inbox.
+    for (const status of [503, 404]) {
+      m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-1/archive', status });
+      const { raw, data } = await s.call('epost_store_letter', { letter_id: 'inbox-1', folder: 'Example_Alpha' });
+      assert.doesNotMatch(raw, /needs the browser|EPOST_TRANSPORT/,
+        `${status}: it went to the portal for an id the portal cannot use: ${raw.slice(0, 200)}`);
+      assert.match(data.error, /letter inbox-1 could not be archived/, `${status}: ${raw.slice(0, 200)}`);
+      assert.match(data.hint, new RegExp(String(status)), 'the reason the API gave is passed on');
+      // Not "it is still in the inbox": a 404 from the archive call is what a
+      // letter archived from another session looks like, and claiming to know
+      // would be the same guess one layer down.
+      assert.match(data.note, /nothing was filed/);
+      assert.ok(m.state.inbox.some(l => l.id === 'inbox-1'), `${status}: the letter left the inbox anyway`);
+      assert.ok(!m.state.archive.some(l => l.id === 'inbox-1'), `${status}: it was archived anyway`);
+    }
+    // And an index the portal CAN honour still falls through to it, rather than
+    // being refused along with the id.
+    m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-1/archive', status: 503 });
+    const { raw } = await s.call('epost_store_letter', { index: 0, folder: 'Example_Alpha' });
+    assert.match(raw, /needs the browser|EPOST_TRANSPORT/,
+      `a position the portal can resolve was refused too: ${raw.slice(0, 200)}`);
+  });
+});
+
+// An inbox nobody has archived in a while. The tools that resolve a letter_id
+// ask for a window of the inbox and used to read the edge of that window as the
+// edge of the letterbox.
+describe('an inbox longer than one listing', () => {
+  let m, s, dir;
+  before(async () => {
+    m = await start();
+    dir = mkdtempSync(join(tmpdir(), 'epost-window-'));
+    // 300 letters past the first, so the window the tools ask for comes back
+    // exactly full and the one being asked about sits beyond it.
+    const proto = JSON.parse(JSON.stringify(m.state.inbox[0]));
+    for (let i = 0; i < 300; i++) m.state.inbox.push({ ...proto, id: `bulk-${i}`, fileName: `bulk-${i}.pdf` });
+    s = await startServer({ EPOST_API_BASE: m.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { s?.stop(); await m?.close(); });
+
+  test('a letter past the window is not reported as one that left the inbox', async () => {
+    // "no letter X in the inbox — it may already be archived, look in Storage"
+    // was said about a letter sitting in the inbox, and the caller was sent
+    // looking for it somewhere it had never been. The window is a property of
+    // our own request, not of the letterbox.
+    const id = 'bulk-299';
+    assert.ok(m.state.inbox.some(l => l.id === id), 'the fixture is supposed to keep it in the inbox');
+    const { data, raw } = await s.call('epost_store_letter', { letter_id: id, folder: 'Example_Alpha' });
+    assert.equal(data.transport, 'api', `a letter in the inbox was refused: ${raw.slice(0, 200)}`);
+    assert.ok(m.state.inFolder['dir-one'].includes(id), 'it was never actually filed');
+    assert.ok(!m.state.inbox.some(l => l.id === id), 'it did not leave the inbox');
+  });
+
+  test('and can still be downloaded by id', async () => {
+    const id = 'bulk-298';
+    const { data, raw } = await s.call('epost_download_letter', { letter_id: id, output_dir: dir });
+    assert.ok(data.saved, `a letter in the inbox could not be downloaded: ${raw.slice(0, 200)}`);
+    // The id is in the bytes, so a download that fetched a neighbour shows up.
+    assert.match(readFileSync(data.saved).toString(), new RegExp(id), 'it fetched a different letter');
+  });
+
+  test('an id that really is nowhere is still answered as missing', async () => {
+    // The second lookup must not turn every unknown id into a call that hangs
+    // about: a 404 there is the service saying the letter does not exist, and
+    // that is the answer the caller gets.
+    const { data } = await s.call('epost_store_letter', { letter_id: 'no-such-letter', folder: 'Example_Alpha' });
+    assert.match(data.error, /no letter no-such-letter in the inbox/);
+    assert.match(data.hint, /epost_list_storage_documents/);
   });
 });
 

@@ -495,7 +495,19 @@ async function withApi(fn) {
 // return the same thing to a client.
 function apiLetterRow(l, i) {
   return {
-    index: i,
+    // Only when this answer really IS a position in a listing the caller can
+    // address by. `index` is the handle epost_download_letter, epost_store_letter
+    // and the Storage tools take, and it was minted here for two answers that
+    // are no such listing: epost_get_letter passed 0 for every letter it was
+    // ever asked about, and epost_search numbered its own hits. So a keyword
+    // naming exactly one letter came back as index 0 for a letter sitting third
+    // in the inbox, and a caller downloading the index it had just been handed
+    // saved the FIRST letter's bytes under the name of the one it had searched
+    // for. One value, two meanings: "first in this list" and "nobody worked out
+    // where it is". The id is the handle both of those tools hand back anyway,
+    // and an absent position is the honest answer — the same rule storedIn is
+    // already held to below.
+    ...(typeof i === 'number' ? { index: i } : {}),
     id: l.id,
     sender: l.description || null,          // "Invoice from <sender>" when known
     title: l.letterTitle || null,
@@ -517,7 +529,14 @@ function apiLetterRow(l, i) {
   };
 }
 
-const apiListLetters = (limit = 200) => withApi(t => apiFetch('GET', '/epost/v2/letters', {
+// How much of the inbox one listing brings back for the tools that resolve a
+// letter_id against it. Named rather than repeated: two tools compare the length
+// they got back against this number to tell "the letter is not in the inbox"
+// apart from "the letter was not in this window", and a literal spelled out in
+// three places is exactly how those two answers drifted into one.
+const INBOX_WINDOW = 200;
+
+const apiListLetters = (limit = INBOX_WINDOW) => withApi(t => apiFetch('GET', '/epost/v2/letters', {
   token: t, params: { 'letter-types': 'CLASSIC_LETTER', 'letter-folder': 'INBOX_FOLDER', limit },
 }));
 
@@ -580,6 +599,30 @@ const apiArchiveLetter = (id, directoryId) => withApi(t => apiFetch('PATCH', `/e
 // --- the rest of the letterbox API -----------------------------------------
 
 const apiGetLetter = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}`, { token: t }));
+
+// Find one letter by id in a listing that may be a WINDOW rather than the whole
+// inbox.
+//
+// Asking for INBOX_WINDOW letters and getting exactly that many means the rest
+// are simply not in this answer — the same thing epost_list_letters reports as
+// `truncated`. Both tools that resolve a letter_id searched the window and then
+// said "no letter X in the inbox" about letters sitting in it, with a hint
+// sending the caller to Storage to look for something that had never left.
+// Proven against the mock: an inbox of three hundred, the last of them archived
+// nowhere, answered as missing while epost_get_letter found it straight away.
+// The service can be asked about one id directly, so ask — but only when the
+// page came back full, because a listing shorter than the window has already
+// answered the question and a second call would only cost a round trip. That
+// second lookup knows nothing about the inbox, mind: it will happily return a
+// letter that is already in Storage. The archive call is what refuses that, in
+// the service's own words, and an id that is nowhere at all still 404s here and
+// comes back null.
+async function letterInWindow(listing, id) {
+  const inPage = listing.find(x => x.id === id);
+  if (inPage || listing.length < INBOX_WINDOW) return inPage || null;
+  const direct = await apiGetLetter(id);
+  return direct || null;
+}
 
 // Full-text search across the letters — something the portal never offered us.
 const apiSearch = (q, where = 'ALL', limit = 50) => withApi(t => apiFetch('GET', '/epost/v2/letters/search', {
@@ -1207,7 +1250,34 @@ async function storeLetter(p, { index, title, folder }) {
   } else if (!(await clickVisibleByText(p, 'Store'))) {
     throw new Error('store confirm button not found in the sheet');
   }
-  await p.waitForTimeout(3000);
+  // Clicking Store is not storing, and this said it was. Nothing below the
+  // click ever looked at the page again, and the click's own failure has to be
+  // swallowed — Playwright waits for the page to settle afterwards and gives up
+  // at the timeout, so on a loaded machine a click that landed perfectly well
+  // still throws — which left "a line of code ran" as the whole of the evidence
+  // for "archived". The portal refuses a sheet the way it refuses a folder name
+  // and a duplicate folder: it leaves the thing standing and says nothing at
+  // all. So the caller got `status: ok` with the letter still in the inbox, and
+  // an overlay left open to swallow the next call's clicks as well. The sheet
+  // going away is the one signal only the commit produces; moveToFolder, which
+  // drives this very sheet, has read it since the round that found the same
+  // hole there.
+  //
+  // Waited for rather than timed: a portal taking its time over the commit is
+  // not a portal refusing it, and a flat sleep would turn the slow one into a
+  // wrong answer in the other direction.
+  await sheet.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => {});
+  if (await sheet.isVisible().catch(() => false)) {
+    const cancel = p.locator('[id$=":cancel"]').first();
+    if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
+    return {
+      status: 'refused',
+      folder,
+      stored: null,
+      reason: 'the portal did not accept the folder sheet',
+      hint: `the sheet stayed open, which is how the portal refuses one — nothing was filed into "${folder}". Re-list the inbox before trying again; the folder may no longer accept this letter, or the session lapsed mid-sheet`,
+    };
+  }
   return { status: 'ok', stored: label, folder };
 }
 
@@ -1495,12 +1565,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       if (args.letter_id && typeof args.index === 'number') {
         return text({ error: 'pass either letter_id or index, not both — they address different things' });
       }
-      const apiLetters = await apiListLetters(200);
+      const apiLetters = await apiListLetters(INBOX_WINDOW);
       if (!apiLetters && args.letter_id) {
         return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'address the letter by index to use the portal instead' });
       }
       if (apiLetters) {
-        const l = args.letter_id ? apiLetters.find(x => x.id === args.letter_id) : apiLetters[args.index];
+        // A full window is not the whole inbox — see letterInWindow.
+        const l = args.letter_id ? await letterInWindow(apiLetters, args.letter_id) : apiLetters[args.index];
         if (l) {
           const bytes = await apiLetterContent(l.id);
           if (bytes) {
@@ -1579,12 +1650,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         if (!dir) {
           return text({ error: `folder "${args.folder}" not found`, available: dirs.filter(d => d.directoryId).map(d => d.directoryName) });
         }
-        const letters = await apiListLetters(200);
+        const letters = await apiListLetters(INBOX_WINDOW);
         if (!letters && args.letter_id) {
           return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'address the letter by index or title to use the portal instead' });
         }
         if (letters) {
-          const l = args.letter_id ? letters.find(x => x.id === args.letter_id)
+          // A full window is not the whole inbox — see letterInWindow.
+          const l = args.letter_id ? await letterInWindow(letters, args.letter_id)
             : typeof args.index === 'number' ? letters[args.index]
               : args.title ? oneByTitle(letters, args.title) : null;
           if (!l && args.letter_id) {
@@ -1595,9 +1667,37 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
               hint: 'it may already be archived — epost_list_storage_documents shows what is in Storage',
             });
           }
-          if (l && await apiArchiveLetter(l.id, dir.directoryId)) {
-            await saveState();
-            return text({ transport: 'api', stored: l.description || l.letterTitle, folder: dir.directoryName, id: l.id });
+          if (l) {
+            if (await apiArchiveLetter(l.id, dir.directoryId)) {
+              await saveState();
+              return text({ transport: 'api', stored: l.description || l.letterTitle, folder: dir.directoryName, id: l.id });
+            }
+            // The id resolved and the PATCH did not come back — a 404, or the
+            // service being unreachable for the length of that one call. Falling
+            // through from here does at the back door exactly what the guard
+            // above refuses at the front, and it is the door epost_download_letter
+            // had shut two rounds ago while this one stood open: the portal
+            // addresses letters by POSITION, so it was handed the index nobody
+            // passed and, after launching a browser to arrive there, complained
+            // about a parameter that had never been part of the question. Pinned
+            // to the API the same fall-through surfaces as a complaint about the
+            // pin, which is no better an answer about a letter the service was
+            // asked to file and did not. An index or a title the portal CAN
+            // honour, so those still fall through to it.
+            //
+            // What this must NOT say is where the letter is now. A 404 from the
+            // archive call is the service saying it has no such letter to file,
+            // which is exactly what a letter archived from another session looks
+            // like — so "it is still in the inbox" would be the same guess, one
+            // layer down, that the rest of this round is about. Nothing was
+            // filed by us is all that is known.
+            if (args.letter_id) {
+              return text({
+                error: `letter ${args.letter_id} could not be archived`,
+                hint: redact(apiWhy() || 'the API listed the inbox but would not file the letter'),
+                note: 'nothing was filed; the portal addresses letters by position and cannot be asked for an id — re-list and pass index or title instead',
+              });
+            }
           }
         }
       }
@@ -1617,14 +1717,19 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // difference decides whether a caller concludes a letter does not exist.
       const searchLimit = args.limit || 50;
       return text({
-        transport: 'api', count: items.length, letters: items.map(apiLetterRow),
+        // A hit's position among the hits is not a position in the inbox, and
+        // `index` is only ever read as the latter — see apiLetterRow.
+        transport: 'api', count: items.length, letters: items.map(l => apiLetterRow(l, null)),
         ...(items.length >= searchLimit ? { truncated: true, hint: `exactly ${searchLimit} matched, so there may be more — raise limit` } : {}),
       });
     }
     if (name === 'epost_get_letter') {
       const l = await apiGetLetter(args.letter_id);
       if (!l) return text({ error: 'not found, or the API is unavailable', hint: apiWhy() });
-      return text({ transport: 'api', ...apiLetterRow(l, 0), raw: l });
+      // No listing was fetched, so there is no position to report — see
+      // apiLetterRow. It used to say 0 about every letter in the letterbox,
+      // trash included.
+      return text({ transport: 'api', ...apiLetterRow(l, null), raw: l });
     }
     if (name === 'epost_unread_count') {
       const c = await apiUnreadCount();
