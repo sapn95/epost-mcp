@@ -220,6 +220,18 @@ describe('archiving', () => {
       `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
   });
 
+  test('and neither is the empty string the same client writes into its string properties', async () => {
+    // The other half of that family: a client with nothing to put in `title`
+    // writes "" rather than null. Testing only for null left those counted, so
+    // a call naming exactly one letter came back refused as naming two — and
+    // epost_download_letter, held to the identical rule, accepted it. Neither
+    // "" is an address the resolver would ever use: it falls through both on
+    // truthiness, and oneByTitle("") matches the whole inbox.
+    const { data } = await srv.call('epost_store_letter', { letter_id: 'arch-1', title: '', folder: 'Example_Alpha' });
+    assert.match(data.error, /no letter arch-1 in the inbox/,
+      `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
+  });
+
   test('marks letters read, and only the ones asked for', async () => {
     // The mock used to answer 204 to anything and change nothing, so this
     // passed on the tool's own echo of its arguments.
@@ -488,6 +500,26 @@ describe('the API answering no', () => {
       `a folder nobody could name was reported as no folder: ${JSON.stringify(data.storedIn)}`);
   });
 
+  test('a document read out of one folder reports every folder it is in, not just that one', async () => {
+    // storedIn is "the folders a document is in", and an ePost document belongs
+    // to as many as it likes. Scoping the lookup filled the field in with the
+    // name of the folder the caller had asked about — the one membership we can
+    // be sure of — so the same tool answered ["Example_Alpha"] here and
+    // ["Example_Alpha","Example_Ümlaut"] about the very same document when
+    // nobody scoped the question. A partial set presented as the set.
+    m.state.inFolder['dir-two'].push('arch-1');          // arch-1 is now in both
+    try {
+      const scoped = await s.call('epost_read_storage_document', { folder_id: 'dir-one', index: 0 });
+      const whole = await s.call('epost_read_storage_document', { letter_id: 'arch-1' });
+      assert.equal(scoped.data.id, 'arch-1');
+      assert.equal(whole.data.storedIn.length, 2, 'the fixture is supposed to put arch-1 in two folders');
+      assert.deepEqual(scoped.data.storedIn, whole.data.storedIn,
+        `scoping the lookup changed the answer about the same document: ${JSON.stringify(scoped.data.storedIn)}`);
+    } finally {
+      m.state.inFolder['dir-two'] = m.state.inFolder['dir-two'].filter(id => id !== 'arch-1');
+    }
+  });
+
   test('a folder that will not answer is not replaced by the whole of Storage', async () => {
     // The guard that keeps a folder-scoped question off the portal used to
     // probe the whole-archive listing instead of the scoped one — and that
@@ -503,6 +535,32 @@ describe('the API answering no', () => {
       `a question about one folder went to the portal, which answers with all of them: ${raw.slice(0, 160)}`);
     assert.match(raw, /folder_id needs the public API/);
     assert.match(raw, /drop folder_id/, 'it says what would work instead');
+  });
+
+  test('a folder the API says is not there is the API answering, not the API being down', async () => {
+    // withApi keeps the two apart on purpose — a 404 is the service being
+    // reached and answering "not here", recorded in apiRefusal with
+    // apiUnavailable CLEARED — and both of these guards read the null it
+    // returns as the API being unavailable. This is the likeliest 404 in the
+    // whole API: a directory-id the caller is still holding from an earlier
+    // epost_list_storage, for a folder since deleted in the portal. Answering
+    // it with "the public API is unavailable, use the portal instead" sends the
+    // caller to a transport that will hand back all of Storage — while
+    // epost_settings, in the same process, still reports the API as working.
+    for (const [tool, args] of [
+      ['epost_list_storage_documents', { folder_id: 'dir-gone' }],
+      ['epost_read_storage_document', { folder_id: 'dir-gone', index: 0 }],
+    ]) {
+      m.state.forceStatus.push({ path: '/epost/v2/archives/letters', status: 404 });
+      const { raw } = await s.call(tool, args);
+      assert.doesNotMatch(raw, /unavailable/, `${tool}: a 404 was read as the API being down: ${raw.slice(0, 200)}`);
+      assert.doesNotMatch(raw, /portal/, `${tool}: it sent the caller to the browser for a question the API answered`);
+      assert.match(raw, /dir-gone is not in Storage/, `${tool}: ${raw.slice(0, 200)}`);
+      assert.match(raw, /404/, `${tool}: the reason the service gave is passed on`);
+    }
+    const { data } = await s.call('epost_settings');
+    assert.doesNotMatch(data.api, /unavailable/,
+      `the same process calls the API healthy while a tool called it unavailable: ${data.api}`);
   });
 
   test('a letter_id the inbox does not hold is answered here, not handed to the portal', async () => {
@@ -545,6 +603,34 @@ describe('the API answering no', () => {
     // property it is not using has still named exactly one document.
     const { data } = await s.call('epost_read_storage_document', { letter_id: 'arch-3', index: null, title: null });
     assert.equal(data.id, 'arch-3', `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
+  });
+
+  test('an empty string beside the selector is not a second document either', async () => {
+    // Same client, other habit: "" goes into the string properties it has
+    // nothing for. Counting those made {letter_id:"",title:"",index:2} a call
+    // naming three documents, while epost_download_letter took the same
+    // arguments and answered.
+    const { data } = await s.call('epost_read_storage_document', { letter_id: '', title: '', index: 2 });
+    assert.equal(data.id, 'arch-3', `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
+  });
+
+  test('two documents at position 0 of two different listings are not one file', async () => {
+    // The saved name was assembled from `index` — but index means a position in
+    // the listing the answer came from, and folder_id decides which listing that
+    // is. So {index:0} and {folder_id:…,index:0} name two DIFFERENT documents,
+    // and with the archive's usual crop of same-day dates they were assembled
+    // into one and the same path: the second call silently overwrote the file
+    // the first had just reported as its own, and nothing downstream could tell.
+    const out = mkdtempSync(join(tmpdir(), 'epost-collide-'));
+    const whole = await s.call('epost_read_storage_document', { index: 0, output_dir: out });
+    const scoped = await s.call('epost_read_storage_document', { folder_id: 'dir-two', index: 0, output_dir: out });
+    assert.notEqual(whole.data.id, scoped.data.id, 'the fixture is supposed to make these two different documents');
+    assert.notEqual(whole.data.saved, scoped.data.saved,
+      `two documents were saved to one path: ${whole.data.saved}`);
+    // The id is in the bytes, so a file holding the wrong document is visible.
+    assert.match(readFileSync(whole.data.saved).toString(), new RegExp(whole.data.id),
+      'the first file holds the second document');
+    assert.match(readFileSync(scoped.data.saved).toString(), new RegExp(scoped.data.id));
   });
 
   test('a document whose content cannot be fetched is a partial result, not a success', async () => {

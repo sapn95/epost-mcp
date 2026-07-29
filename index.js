@@ -527,16 +527,20 @@ const apiListArchive = (directoryId, limit = 1000) => withApi(t => apiFetch('GET
   token: t, params: { limit, 'directory-id': directoryId || undefined },
 }));
 
-// The archive listing carries NO folder field, so a document read from it looks
-// unfiled even when it is not — which would have a caller re-file the whole
-// archive. Membership has to be derived by asking each folder what it holds.
-// One call per folder, and there are few of them.
-async function apiArchiveWithFolders(limit = 1000) {
-  const all = await apiListArchive(undefined, limit);
-  if (!all) return null;
-  const items = Array.isArray(all) ? all : (all.letters || all.content || []);
+// Which folders hold which documents. The archive listing carries NO folder
+// field, so a document read from it looks unfiled even when it is not — which
+// would have a caller re-file the whole archive — and membership has to be
+// derived by asking each folder what it holds. One call per folder, and there
+// are few of them.
+//
+// Its own function because two callers need the answer and they used to derive
+// it differently: the scoped read had a shortcut of its own that named only the
+// folder the caller had asked about, so the same tool answered ["Alpha"] about a
+// document it answers ["Alpha","Ümlaut"] about when nobody scopes the question.
+// One expression, one answer.
+async function apiFolderMap(limit = 1000) {
   const dirs = await apiListDirectories();
-  if (!dirs) return items;
+  if (!dirs) return null;
   const folders = new Map();
   // A folder that cannot be listed tells us nothing about what is in it. Folding
   // that into the same `null` as "in no folder" would report filed documents as
@@ -545,18 +549,24 @@ async function apiArchiveWithFolders(limit = 1000) {
   for (const d of dirs.filter(x => x.directoryId)) {
     const inDir = await apiListArchive(d.directoryId, limit);
     if (inDir === null) { complete = false; continue; }
-    // Same unwrapping as the archive listing above, `content` included: this
-    // one accepted only `letters`, so a service answering with the wrapper the
+    // Same unwrapping as the archive listing, `content` included: this one
+    // accepted only `letters`, so a service answering with the wrapper the
     // other branch already handles reported every document as unfiled.
     for (const l of (Array.isArray(inDir) ? inDir : (inDir?.letters || inDir?.content || []))) {
       folders.set(l.id, [...(folders.get(l.id) || []), d.directoryName]);
     }
   }
-  return items.map(l => ({
-    ...l,
-    // undefined = not looked up, as apiLetterRow already documents
-    directoryNames: folders.get(l.id) ?? (complete ? null : undefined),
-  }));
+  // undefined = not looked up, as apiLetterRow already documents
+  return { of: id => folders.get(id) ?? (complete ? null : undefined) };
+}
+
+async function apiArchiveWithFolders(limit = 1000) {
+  const all = await apiListArchive(undefined, limit);
+  if (!all) return null;
+  const items = Array.isArray(all) ? all : (all.letters || all.content || []);
+  const map = await apiFolderMap(limit);
+  if (!map) return items;
+  return items.map(l => ({ ...l, directoryNames: map.of(l.id) }));
 }
 
 const apiLetterContent = id => withApi(t => apiFetch('GET', `/epost/v2/letters/${id}/content`, { token: t, raw: true }));
@@ -1550,7 +1560,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // null into the ones it is not using — which is how a great many of them
       // are built — had a perfectly unambiguous call thrown back at it, with a
       // complaint naming the two parameters it had deliberately left empty.
-      const given = ['letter_id', 'index', 'title'].filter(k => args[k] != null);
+      // The other half of that same family writes an empty STRING into the
+      // string properties it has nothing for, and testing only for null left
+      // those counted: {letter_id:"", title:"", index:0} came back refused as
+      // naming three letters. Neither "" is an address the resolver below would
+      // ever use — it falls through both on truthiness — and epost_download_letter,
+      // held to the same rule, already accepted the call. Empty is empty.
+      const given = ['letter_id', 'index', 'title'].filter(k => args[k] != null && args[k] !== '');
       if (given.length > 1) {
         return text({ error: `pass one of letter_id, index or title — got ${given.join(' and ')}, which may name different letters` });
       }
@@ -1690,8 +1706,21 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // document in Storage under the heading of one folder. Guard the call
       // that actually answers; the probe is then not needed either, and asking
       // about one folder stops costing a full listing plus one call per folder.
+      //
+      // Two different things produce that null and only one of them is "the API
+      // is unavailable". withApi deliberately keeps them apart — a 404 is the
+      // service being reached and answering "not here", which it records in
+      // apiRefusal while CLEARING apiUnavailable — and this read both as the
+      // API being down. The likeliest 404 in the whole API is exactly this
+      // call: a directory-id the caller is still holding from an earlier
+      // epost_list_storage, for a folder since deleted in the portal. Answering
+      // that with "the public API is unavailable, use the portal instead" sends
+      // the caller to the browser to be told about all of Storage, while
+      // epost_settings in the same process still reports the API as working.
       if (!viaApi && args.folder_id) {
-        return text({ error: 'folder_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'drop folder_id to list the whole of Storage through the portal' });
+        return text(apiUnavailable
+          ? { error: 'folder_id needs the public API and it is unavailable', hint: redact(apiUnavailable), note: 'drop folder_id to list the whole of Storage through the portal' }
+          : { error: `folder ${args.folder_id} is not in Storage, or the API would not list it`, hint: redact(apiRefusal || 'the service answered, but not with a listing'), note: 'epost_list_storage shows the folders that exist, with their ids' });
       }
       if (viaApi) {
         const items = Array.isArray(viaApi) ? viaApi : (viaApi.letters || viaApi.content || []);
@@ -1725,8 +1754,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // saved the PDF under the index it had not used, so a second such call
       // with the same date overwrote the first. A null is not a selector: a
       // client that writes one into every property it is not using must not be
-      // told it asked for two documents.
-      const given = ['letter_id', 'index', 'title'].filter(k => args[k] != null);
+      // told it asked for two documents — nor is an empty string, which is what
+      // the same kind of client writes into a string property it has nothing
+      // for. See epost_store_letter, which is held to the identical rule.
+      const given = ['letter_id', 'index', 'title'].filter(k => args[k] != null && args[k] !== '');
       if (given.length > 1) {
         return text({ error: `pass one of letter_id, index or title — got ${given.join(' and ')}, which may name different documents` });
       }
@@ -1738,8 +1769,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       const arch = args.folder_id
         ? await apiListArchive(args.folder_id, 1000)
         : await apiArchiveWithFolders(1000);
+      // The same two meanings of null as in epost_list_storage_documents. Only
+      // the folder-scoped call is worth telling apart, though: without a
+      // directory-id this is the archive endpoint itself, and a 404 from that
+      // really does mean the API cannot serve the request.
       if (!arch && apiOnly) {
-        return text({ error: 'this needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'folder_id and letter_id cannot be honoured through the portal — drop them to read by position instead' });
+        return text(apiUnavailable || !args.folder_id
+          ? { error: 'this needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'folder_id and letter_id cannot be honoured through the portal — drop them to read by position instead' }
+          : { error: `folder ${args.folder_id} is not in Storage, or the API would not list it`, hint: redact(apiRefusal || 'the service answered, but not with a listing'), note: 'epost_list_storage shows the folders that exist, with their ids' });
       }
       if (arch) {
         const items = Array.isArray(arch) ? arch : (arch.letters || arch.content || []);
@@ -1751,17 +1788,22 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         if (!l && apiOnly) {
           return text({ error: 'no such document in Storage', folder_id: args.folder_id ?? null, letter_id: args.letter_id ?? null });
         }
-        if (l && args.folder_id && l.directoryNames === undefined) {
-          // Scoped listing: we know which folder it came from, because we asked.
-          // Only if the folder has a name to report, though. Written as a
-          // one-element array run through filter(Boolean), a directory listing
-          // that did not answer left an EMPTY array behind — which says "this
-          // document is in no folder at all" about the very document the caller
-          // had just read out of one, and a caller acting on that re-files it.
-          // Not knowing the folder's name is "membership was not looked up",
-          // which is what an absent storedIn already means.
-          const folderName = (await apiListDirectories() || []).find(d => d.directoryId === args.folder_id)?.directoryName;
-          if (folderName) l.directoryNames = [folderName];
+        if (l && args.folder_id) {
+          // A scoped listing carries no folder field either. This used to fill
+          // it in with the name of the folder the caller had asked about — the
+          // one membership we can be sure of — and that is not what storedIn
+          // says: an ePost document belongs to as many folders as it likes, so
+          // naming one of them presented a partial set as the set. The same
+          // tool answered ["Example_Alpha"] here and ["Example_Alpha",
+          // "Example_Ümlaut"] about the very same document when nobody scoped
+          // the question. Derived through apiFolderMap now, the same expression
+          // the unscoped path uses, so the two answers cannot drift apart.
+          //
+          // Nothing found stays ABSENT rather than becoming an empty array: a
+          // document reached THROUGH a folder is in one, and "in no folder at
+          // all" is the answer that has a caller re-file the archive.
+          const names = (await apiFolderMap(1000))?.of(l.id);
+          if (names?.length) l.directoryNames = names;
         }
         if (l) {
           // Where the document actually sits in the listing this answer came
@@ -1775,10 +1817,19 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             const bytes = await apiLetterContent(l.id);
             if (bytes) {
               mkdirSync(args.output_dir, { recursive: true });
-              saved = join(args.output_dir, `${namePart((l.receivedDateTime || '').slice(0, 10) || 'undated')}_ePostStorage_${namePart(args.index ?? l.id)}.pdf`);
+              // Named after the document, not after however the caller happened
+              // to address it. `index` means a position in the listing this
+              // answer came from, and folder_id changes which listing that is:
+              // {index:0} and {folder_id:"…",index:0} name two DIFFERENT
+              // documents, and with the archive's usual crop of same-day dates
+              // they were assembled into one and the same path — the second
+              // call silently overwriting the file the first had just reported
+              // as its own. The id is the one thing that identifies exactly one
+              // document, and it is already in the answer beside this.
+              saved = join(args.output_dir, `${namePart((l.receivedDateTime || '').slice(0, 10) || 'undated')}_ePostStorage_${namePart(l.id)}.pdf`);
               // Correspondence: written with the process umask it can land
-            // group- and world-readable.
-            writePrivate(saved, bytes);
+              // group- and world-readable.
+              writePrivate(saved, bytes);
             }
           }
           // Same rule as the browser path: asking for the file and being told
