@@ -206,6 +206,20 @@ describe('archiving', () => {
     assert.match(data.error, /letter_id and index/);
   });
 
+  test('a null in the properties it is not using is not a second selector', async () => {
+    // Plenty of clients fill in every property the schema declares and write
+    // null into the ones they have nothing for. Testing only for `undefined`
+    // read those nulls as selectors, so an entirely unambiguous call came back
+    // refused — with a complaint naming the two parameters the caller had
+    // deliberately left empty.
+    // arch-1 is already in Storage, so the call gets that far and stops there —
+    // which is the point: it was resolved as the single letter it names rather
+    // than refused at the door, and nothing in the letterbox moved to prove it.
+    const { data } = await srv.call('epost_store_letter', { letter_id: 'arch-1', index: null, title: null, folder: 'Example_Alpha' });
+    assert.match(data.error, /no letter arch-1 in the inbox/,
+      `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
+  });
+
   test('marks letters read, and only the ones asked for', async () => {
     // The mock used to answer 204 to anything and change nothing, so this
     // passed on the tool's own echo of its arguments.
@@ -457,6 +471,80 @@ describe('the API answering no', () => {
     const { data } = await s.call('epost_read_storage_document', { folder_id: 'dir-one', index: 0 });
     assert.equal(data.id, 'arch-1');
     assert.deepEqual(data.storedIn, ['Example_Alpha'], `no folder reported: ${JSON.stringify(data.storedIn)}`);
+  });
+
+  test('a folder whose name cannot be looked up is not reported as no folder at all', async () => {
+    // The scoped listing knows which folder the document came from, because the
+    // caller named it — but it only knows the id, and the name has to be
+    // fetched. Written as a one-element array run through filter(Boolean), a
+    // directory listing that did not answer left an EMPTY array behind: an
+    // affirmative "in no folder" about the very document that had just been
+    // read out of one, which is the answer that has a caller re-file the
+    // archive. Absent means "not looked up", and that is the truth here.
+    m.state.forceStatus.push({ path: '/epost/v2/archives/directories', status: 503 });
+    const { data } = await s.call('epost_read_storage_document', { folder_id: 'dir-one', index: 0 });
+    assert.equal(data.id, 'arch-1');
+    assert.ok(!('storedIn' in data),
+      `a folder nobody could name was reported as no folder: ${JSON.stringify(data.storedIn)}`);
+  });
+
+  test('a folder that will not answer is not replaced by the whole of Storage', async () => {
+    // The guard that keeps a folder-scoped question off the portal used to
+    // probe the whole-archive listing instead of the scoped one — and that
+    // listing tolerates a folder that fails and returns anyway. So the single
+    // case it was written for got through: the folder asked about is the one
+    // thing that will not answer, the scoped call comes back null, and the
+    // portal — which has no notion of a folder — replies with every document in
+    // Storage under the heading of that one folder.
+    m.state.failDirectoryId = 'dir-one';
+    const { raw } = await s.call('epost_list_storage_documents', { folder_id: 'dir-one' });
+    m.state.failDirectoryId = null;
+    assert.doesNotMatch(raw, /needs the browser/,
+      `a question about one folder went to the portal, which answers with all of them: ${raw.slice(0, 160)}`);
+    assert.match(raw, /folder_id needs the public API/);
+    assert.match(raw, /drop folder_id/, 'it says what would work instead');
+  });
+
+  test('a letter_id the inbox does not hold is answered here, not handed to the portal', async () => {
+    // The API listed the inbox and the id is not in it. That is an answer, and
+    // the portal cannot improve on it: it addresses letters by POSITION, so it
+    // was handed the index nobody passed and — after launching a browser to get
+    // there — reported "index undefined out of range (2 letters)", an error
+    // about a parameter that was never part of the question. Pinned to the API
+    // the same fall-through shows up as "needs the browser", which is just as
+    // wrong about a request the API had already answered.
+    const { raw } = await s.call('epost_download_letter', { letter_id: 'no-such-letter', output_dir: dir });
+    assert.doesNotMatch(raw, /needs the browser/, `it went to the portal for an id the portal cannot use: ${raw.slice(0, 160)}`);
+    assert.match(raw, /no letter no-such-letter in the inbox/);
+    assert.match(raw, /epost_list_storage_documents/, 'it names the tool that would show it');
+  });
+
+  test('a letter_id whose content will not come is reported, not retried by position', async () => {
+    // Same fall-through, second door: the id resolved, the document did not.
+    m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-1/content', status: 503 });
+    const { raw } = await s.call('epost_download_letter', { letter_id: 'inbox-1', output_dir: dir });
+    assert.doesNotMatch(raw, /needs the browser/, `it went to the portal for an id the portal cannot use: ${raw.slice(0, 160)}`);
+    assert.match(raw, /content of letter inbox-1 could not be fetched/);
+    assert.match(raw, /503/, 'the reason the API gave is passed on');
+  });
+
+  test('two ways of naming a Storage document is a question here too', async () => {
+    // epost_store_letter was taught this; this one still let letter_id win over
+    // index in silence, and the file name gave it away: the answer reported the
+    // id's real position and then saved the PDF under the index it had NOT
+    // used, so a second such call with the same date overwrote the first.
+    const out = join(dir, 'ambiguous');
+    const { data } = await s.call('epost_read_storage_document', { letter_id: 'arch-3', index: 0, output_dir: out });
+    assert.match(data.error, /pass one of letter_id, index or title/);
+    assert.match(data.error, /letter_id and index/);
+    assert.ok(!existsSync(out), 'a document was read and saved for a request that named two of them');
+  });
+
+  test('a null beside the selector is not a second document', async () => {
+    // The same rule as for archiving: a client that writes null into every
+    // property it is not using has still named exactly one document.
+    const { data } = await s.call('epost_read_storage_document', { letter_id: 'arch-3', index: null, title: null });
+    assert.equal(data.id, 'arch-3', `an unambiguous call was refused as ambiguous: ${JSON.stringify(data)}`);
   });
 
   test('a document whose content cannot be fetched is a partial result, not a success', async () => {

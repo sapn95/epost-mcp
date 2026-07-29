@@ -1,10 +1,18 @@
 #!/usr/bin/env node
 // epost-mcp — MCP server for the Swiss ePost digital letterbox (app.epost.ch).
 //
-// ePost offers no public retrieval API for private customers, so this server
-// drives the web portal with Playwright. The SwissID session is cached as a
-// Playwright storageState file so it survives server restarts; when it expires,
-// call `epost_login` and complete SwissID interactively in the opened window.
+// ePost publishes a documented REST API for the Digital Letterbox that a
+// private tenant can authenticate against, so that is the transport of choice —
+// see the API section below. The web portal is still driven with Playwright,
+// for the operations the API does not cover and for when it cannot be reached.
+// This header said for a long time that no public API existed for private
+// customers, which is how it was written before the password grant was found,
+// and the whole of the API section has contradicted it ever since.
+//
+// The SwissID session is kept in a persistent browser profile AND in a
+// storageState file, which cover different halves of the problem (see
+// openContext); when it expires, call `epost_login` and confirm SwissID in the
+// window it opens.
 //
 // Env:
 //   EPOST_STATE     storageState json path  (default: ~/.epost-mcp/state.json)
@@ -15,6 +23,8 @@
 //   EPOST_API_PASSWORD  API password (or keychain epost-mcp-api-password)
 //   EPOST_API_KEY       X-API-KEY (or keychain epost-mcp-api-key) — alternative
 //                       to the password grant, or sent alongside it
+//   EPOST_API_BASE  API host  (default: https://api.epost.ch) — for tests
+//   EPOST_APP_URL   portal base (default: https://app.epost.ch) — for tests
 //   EPOST_DEBUG     1 = trace the login steps on stderr
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -1493,6 +1503,26 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             return text({ transport: 'api', saved, bytes: bytes.length, description: l.description });
           }
         }
+        // The API listed the inbox and still could not finish this: either the
+        // id is not in it, or the document's content would not come. Falling
+        // through from here does at the back door exactly what the guard above
+        // refuses at the front — the portal addresses letters by POSITION, so
+        // it was handed the index nobody passed and answered "index undefined
+        // out of range (2 letters)", an error about a parameter that was never
+        // part of the question, after launching a browser to arrive at it. Both
+        // sibling tools learned to refuse this; this one had not.
+        if (args.letter_id) {
+          return text(l
+            ? {
+              error: `the content of letter ${args.letter_id} could not be fetched`,
+              hint: redact(apiWhy() || 'the API listed the inbox but would not serve the document'),
+              note: 'the portal addresses letters by position and cannot be asked for an id — re-list and pass index instead',
+            }
+            : {
+              error: `no letter ${args.letter_id} in the inbox`,
+              hint: 'it may already be archived — epost_list_storage_documents shows what is in Storage',
+            });
+        }
       }
       const st = await ensureSession(await p());
       if (st !== 'ok') return text({ status: 'login_required', message: 'Run epost_login first (SwissID).' });
@@ -1514,7 +1544,13 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       if (!args.folder) throw new Error('folder is required — the Store sheet will not commit without one');
       // letter_id wins over index and title silently, so a call that named two
       // different letters archived one and reported the request as given.
-      const given = ['letter_id', 'index', 'title'].filter(k => args[k] !== undefined);
+      //
+      // A null is not a selector, though, and testing for `undefined` alone
+      // made it one: a client that fills in every declared property and writes
+      // null into the ones it is not using — which is how a great many of them
+      // are built — had a perfectly unambiguous call thrown back at it, with a
+      // complaint naming the two parameters it had deliberately left empty.
+      const given = ['letter_id', 'index', 'title'].filter(k => args[k] != null);
       if (given.length > 1) {
         return text({ error: `pass one of letter_id, index or title — got ${given.join(' and ')}, which may name different letters` });
       }
@@ -1638,16 +1674,25 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       return text(out);
     }
     if (name === 'epost_list_storage_documents') {
-      // folder_id is an API concept; the portal lists everything. Falling
-      // through with one set answered "all of Storage" to a question about one
-      // folder, and the caller could not tell.
-      if (args.folder_id) {
-        const scoped = await apiArchiveWithFolders(1000);
-        if (!scoped) return text({ error: 'folder_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'drop folder_id to list the whole of Storage through the portal' });
-      }
       const viaApi = args.folder_id
         ? await apiListArchive(args.folder_id, args.limit || 1000)
         : await apiArchiveWithFolders(args.limit || 1000);
+      // folder_id is an API concept; the portal lists everything. Falling
+      // through with one set answered "all of Storage" to a question about one
+      // folder, and the caller could not tell.
+      //
+      // The guard that says so used to probe a DIFFERENT call: it listed the
+      // whole archive first and refused only if THAT came back empty-handed. So
+      // the one case it exists for — the folder being asked about is the single
+      // thing that will not answer — walked straight past it, because the
+      // whole-archive listing tolerates a folder that fails and returns anyway.
+      // The scoped call then produced null and the portal answered with every
+      // document in Storage under the heading of one folder. Guard the call
+      // that actually answers; the probe is then not needed either, and asking
+      // about one folder stops costing a full listing plus one call per folder.
+      if (!viaApi && args.folder_id) {
+        return text({ error: 'folder_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'drop folder_id to list the whole of Storage through the portal' });
+      }
       if (viaApi) {
         const items = Array.isArray(viaApi) ? viaApi : (viaApi.letters || viaApi.content || []);
         // A full page cannot be told from a complete archive, and presenting
@@ -1672,6 +1717,19 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // "whatever is at that position in the whole of Storage" — a different
       // document, downloaded and reported as the one that was asked for.
       const apiOnly = args.folder_id || args.letter_id;
+      // The same rule epost_store_letter is held to, and for the same reason:
+      // letter_id wins over index and index over title, silently, so a call
+      // naming two different documents read one of them and echoed the request
+      // back as it was given. It showed up in the file name — a call with a
+      // letter_id and an index reported the id's position, correctly, and then
+      // saved the PDF under the index it had not used, so a second such call
+      // with the same date overwrote the first. A null is not a selector: a
+      // client that writes one into every property it is not using must not be
+      // told it asked for two documents.
+      const given = ['letter_id', 'index', 'title'].filter(k => args[k] != null);
+      if (given.length > 1) {
+        return text({ error: `pass one of letter_id, index or title — got ${given.join(' and ')}, which may name different documents` });
+      }
       // The raw archive listing carries no folder field — the very thing
       // apiArchiveWithFolders exists to fill in — so this reported storedIn as
       // absent for every document while the tool description promises the
@@ -1695,7 +1753,15 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         }
         if (l && args.folder_id && l.directoryNames === undefined) {
           // Scoped listing: we know which folder it came from, because we asked.
-          l.directoryNames = [(await apiListDirectories() || []).find(d => d.directoryId === args.folder_id)?.directoryName].filter(Boolean);
+          // Only if the folder has a name to report, though. Written as a
+          // one-element array run through filter(Boolean), a directory listing
+          // that did not answer left an EMPTY array behind — which says "this
+          // document is in no folder at all" about the very document the caller
+          // had just read out of one, and a caller acting on that re-files it.
+          // Not knowing the folder's name is "membership was not looked up",
+          // which is what an absent storedIn already means.
+          const folderName = (await apiListDirectories() || []).find(d => d.directoryId === args.folder_id)?.directoryName;
+          if (folderName) l.directoryNames = [folderName];
         }
         if (l) {
           // Where the document actually sits in the listing this answer came
