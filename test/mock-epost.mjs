@@ -65,6 +65,12 @@ export function start() {
     // A gateway that answers a thumbnail request with an error PAGE, 200 and
     // all. Any 200 used to be saved under the thumbnail's name.
     thumbnailAsHtml: false,
+    // The same gateway on the endpoint that serves the correspondence itself.
+    // The thumbnail grew a signature check two rounds ago and this one never
+    // did, so an error page was written to a .pdf and reported as the letter,
+    // with a byte count beside it. Nothing here could produce it: the content
+    // route has only ever served a PDF.
+    contentAsHtml: false,
     // One folder that cannot be listed while its neighbours can. The archive
     // listing carries no folder field, so membership is derived by asking each
     // folder what it holds — and when one of those calls fails, the documents
@@ -155,11 +161,19 @@ export function start() {
       });
     }
     if (p === '/epost/v2/archives/directories') return send(200, DIRECTORIES);
+    // `limit` is honoured here too. The inbox listing was taught to last round,
+    // because the server reads the edge of the window it asked for as the edge
+    // of the letterbox — and the archive listing, which the Storage tools read
+    // exactly the same way, was left handing back everything however little was
+    // asked for. A full page could therefore never occur, and "no such document
+    // in Storage" about a document sitting in it could not be caught.
     if (p === '/epost/v2/archives/letters') {
       const d = url.searchParams.get('directory-id');
+      const n = Number(url.searchParams.get('limit'));
+      const cap = xs => (n > 0 ? xs.slice(0, n) : xs);
       if (d && d === state.failDirectoryId) return send(503, { error: 'directory_unavailable' });
-      if (d) return send(200, state.archive.filter(l => (state.inFolder[d] || []).includes(l.id)));
-      return send(200, state.archive);           // note: no folder field, like the real one
+      if (d) return send(200, cap(state.archive.filter(l => (state.inFolder[d] || []).includes(l.id))));
+      return send(200, cap(state.archive));      // note: no folder field, like the real one
     }
     const m = /^\/epost\/v2\/letters\/([^/]+)(\/.*)?$/.exec(p);
     if (m) {
@@ -170,7 +184,10 @@ export function start() {
       // The id goes in the bytes: identical content for every letter meant a
       // download that fetched the wrong one was indistinguishable from a
       // correct one.
-      if (tail === '/content') return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
+      if (tail === '/content') {
+        if (state.contentAsHtml) return send(200, '<html><body>gateway error</body></html>', 'text/html');
+        return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
+      }
       // The real eight PNG magic bytes. Written as a string, "\x89" goes out as
       // two UTF-8 bytes and the fixture served something that was not a PNG at
       // all — which a caller checking the signature would rightly reject.

@@ -97,6 +97,32 @@ describe('portal automation', () => {
     }
   });
 
+  test('a sheet that never opened is not a sheet that went away', SLOW, async () => {
+    // The refusal above is read from the sheet still standing, so its absence
+    // is the whole of the evidence for "archived" — and a sheet that never
+    // opened is absent too. The overlay lives in the DOM the entire time and is
+    // only toggled hidden, the way PrimeFaces builds every dialog, so when the
+    // menu item failed to open it the tile lookup (which must not filter on
+    // visibility, because the strip scrolls sideways) found the hidden tiles
+    // and ticked one, the forced click on the hidden Store button threw and was
+    // swallowed, and waiting for "hidden" was satisfied by a sheet that had
+    // never been shown. `status: ok` for a letter still in the inbox.
+    // createFolder, the same two-step shape, has always let its dialog's
+    // waitFor throw rather than throwing the answer away.
+    const before = portal.state.stored.length;
+    portal.state.sheetStuck = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_store_letter', { index: 0, folder: 'Example_Alpha' });
+      assert.ok(isError || data.status === 'refused',
+        `a store into a sheet that never opened was reported as done: ${raw.slice(0, 200)}`);
+      assert.match(raw, /did not open|nothing was filed/,
+        `it does not say the sheet never opened: ${raw.slice(0, 200)}`);
+      assert.equal(portal.state.stored.length, before, 'the sheet was committed after all');
+    } finally {
+      portal.state.sheetStuck = false;
+    }
+  });
+
   test('downloads a letter to disk', SLOW, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'epost-dl-'));
     const { data, raw } = await srv.call('epost_download_letter', { index: 0, output_dir: dir });
