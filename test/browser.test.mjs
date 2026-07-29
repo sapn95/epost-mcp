@@ -125,17 +125,32 @@ describe('portal automation', () => {
     assert.ok(portal.state.stored.length > before, 'the sheet was committed');
   });
 
-  test('a login that never authenticates reports login_required, not success', SLOW, async () => {
-    // The fixture has no SwissID chain, so the assisted login can only time out.
-    // What matters is that it says so rather than claiming a session. 30 is the
-    // documented minimum — anything shorter is clamped, and a test that asked
-    // for five seconds and waited thirty implied a promise the code never made.
-    const started = Date.now();
-    const { data } = await srv.call('epost_login', { wait_seconds: 30 });
-    assert.ok(Date.now() - started >= 29000, 'it returned before the window it was given');
-    assert.equal(data.status, 'login_required',
-      'no authenticated session exists, so login must not claim one');
-    assert.ok(data.hint || data.browser, 'it says what the caller should do next');
+  test('a login step that has not rendered yet is tried again, and never authenticates', SLOW, async () => {
+    // Two things at once, because the window is thirty seconds either way.
+    //
+    // The fixture cannot finish a SwissID login, so this must report
+    // login_required rather than claim a session. 30 is the documented minimum
+    // — anything shorter is clamped, and a test that asked for five seconds and
+    // waited thirty implied a promise the code never made.
+    //
+    // And the e-mail step: the fixture's login page renders its input three
+    // seconds after the redirect lands, exactly as the real one does. A step
+    // that is written off after one look never sees the field, so the e-mail is
+    // never submitted and the login sits there until the window runs out. The
+    // submitted address is the only proof that the step was tried again.
+    portal.state.loginFlow = true;
+    try {
+      const started = Date.now();
+      const { data } = await srv.call('epost_login', { wait_seconds: 30 });
+      assert.ok(Date.now() - started >= 29000, 'it returned before the window it was given');
+      assert.equal(data.status, 'login_required',
+        'no authenticated session exists, so login must not claim one');
+      assert.ok(data.hint || data.browser, 'it says what the caller should do next');
+      assert.deepEqual(portal.state.loginEmails, ['test@example.invalid'],
+        'the e-mail step was written off on the first pass, before the field existed');
+    } finally {
+      portal.state.loginFlow = false;
+    }
   });
 
   test('reports the session state', SLOW, async () => {

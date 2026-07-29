@@ -316,6 +316,15 @@ const KC_API_PASSWORD = 'epost-mcp-api-password';
 
 let apiToken = null;          // { value, expiresAt, tenant }
 let apiUnavailable = null;    // why the API cannot be used, once known
+// Why the last call came back empty-handed even though the API itself is fine.
+// A 404 is the service answering "not here", which says nothing about whether
+// the API can be used — but it was recorded as unavailability, so asking for one
+// letter that does not exist made epost_settings report the whole API as
+// unavailable for as long as no other call happened to succeed. The two are kept
+// apart: this one explains a single empty answer, apiUnavailable answers "can
+// the API be used at all".
+let apiRefusal = null;
+const apiWhy = () => apiUnavailable || apiRefusal;
 
 function apiKey() {
   if (TRANSPORT === 'browser') return '';
@@ -439,7 +448,11 @@ async function withApi(fn) {
   // A call that works is proof the API is reachable. Without this, one early
   // failure left epost_settings reporting the API unavailable for the life of
   // the process, long after it had recovered.
-  const ok = v => { apiUnavailable = null; return v; };
+  const ok = v => { apiUnavailable = null; apiRefusal = null; return v; };
+  // A 404 came back, which means the service was reached and answered. Recording
+  // that as unavailability made a healthy API look broken to everything that
+  // reads apiUnavailable afterwards, epost_settings included.
+  const answered = msg => { apiUnavailable = null; apiRefusal = msg; return null; };
   try {
     return ok(await fn(bearer()));
   } catch (e) {
@@ -451,6 +464,7 @@ async function withApi(fn) {
           // second attempt. Swallowing it as unavailability sent the caller to
           // the browser to do something the service had just refused.
           if (e2.status >= 400 && e2.status < 500 && e2.status !== 401 && e2.status !== 404) throw e2;
+          if (e2.status === 404) return answered(e2.message);
           apiUnavailable = e2.message;
           if (DEBUG) console.error('[api] retry failed:', e2.message);
           return null;
@@ -460,6 +474,7 @@ async function withApi(fn) {
       return null;
     }
     if (e.status >= 400 && e.status < 500 && e.status !== 404) throw e;
+    if (e.status === 404) return answered(e.message);
     apiUnavailable = e.message;
     if (DEBUG) console.error('[api] call failed:', e.message);
     return null;
@@ -479,8 +494,16 @@ function apiLetterRow(l, i) {
     receivedDateTime: l.receivedDateTime || null,
     fileName: l.fileName || null,
     read: l.readStatus === 'READ',
-    // null = in no folder; undefined = membership was not looked up
-    storedIn: l.directoryNames ?? l.directoryName ?? undefined,
+    // null = in no folder; undefined = membership was not looked up. Written
+    // with ?? this could not express the first of those: ?? passes null on to
+    // the next candidate, so a document apiArchiveWithFolders had established
+    // was in NO folder arrived here as null, fell through to the absent
+    // directoryName, and left as undefined — which JSON.stringify drops
+    // entirely. Both meanings therefore reached the client as a missing field,
+    // and a caller reading that as "unfiled" would re-file every document whose
+    // folder simply could not be listed. Only a genuinely absent value may fall
+    // through.
+    storedIn: l.directoryNames !== undefined ? l.directoryNames : l.directoryName,
   };
 }
 
@@ -987,13 +1010,33 @@ async function assistedLogin(p, waitMs = 300000) {
   // not finished rendering was tried exactly once, failed, and never tried
   // again — a login that would have succeeded a second later instead sat there
   // until the window ran out.
+  //
+  // Catching what the action throws is not enough on its own, and for a while
+  // that was all this did: every action below swallowed its own failures, so
+  // returning normally proved only that it had run, not that the control was
+  // ever there. The step was written off exactly as before and no retry could
+  // ever happen. An action now says whether it acted, and only that counts.
+  //
+  // What an action must NOT do is report the click itself as the thing that
+  // succeeded. Playwright waits for the page to settle after a click and gives
+  // up at the timeout, so on a loaded machine a click that landed perfectly
+  // well still throws — and treating that as "not yet" pressed Weiter again on
+  // the next pass, and again, submitting the e-mail address to SwissID seven
+  // times in half a minute. Whether the control was on the page is the honest
+  // signal, and it is the one this was written for; the click's own outcome is
+  // the page's to report, one iteration later.
   const once = async (step, action) => {
     if (done.has(step)) return false;
     if (DEBUG) console.error('[login]', step);
+    let acted;
     try {
-      await action();
+      acted = await action();
     } catch (e) {
       if (DEBUG) console.error('[login]', step, 'not yet:', (e.message || '').split('\n')[0].slice(0, 80));
+      return false;
+    }
+    if (!acted) {
+      if (DEBUG) console.error('[login]', step, 'not yet: the control is not on the page');
       return false;
     }
     done.add(step);
@@ -1015,30 +1058,42 @@ async function assistedLogin(p, waitMs = 300000) {
         || await p.getByText('Digital Letterbox', { exact: false }).count().catch(() => 0))) {
       return ensureLetterbox(p);
     }
+    // Each of these reports whether it actually drove the step. A control that
+    // is not on the page yet is "not yet", not "done": the swallowed click that
+    // used to stand in for both is what made the retry above unreachable.
     if (/login\.epost\.ch/.test(u) && await once('swissid', async () => {
       const b = p.getByRole('button', { name: /Login mit SwissID/i }).first();
-      if (await b.count().catch(() => 0)) await b.click({ timeout: 8000 }).catch(() => {});
+      if (!await b.count().catch(() => 0)) return false;
+      await b.click({ timeout: 8000 }).catch(() => {});
+      return true;
     })) continue;
 
     if (/login-email/.test(u) && user && await once('email', async () => {
       const i = p.locator('input[type=text], input[type=email]').first();
-      if (await i.count().catch(() => 0)) {
-        await i.fill(user, { timeout: 8000 }).catch(() => {});
-        const n = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
-        if (await n.count().catch(() => 0)) await n.click({ timeout: 8000 }).catch(() => {});
-      }
+      if (!await i.count().catch(() => 0)) return false;
+      await i.fill(user, { timeout: 8000 });
+      // Filling again on a later pass is harmless — fill replaces the value —
+      // so a form whose button arrives after its input is still finished.
+      const n = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
+      if (!await n.count().catch(() => 0)) return false;
+      await n.click({ timeout: 8000 }).catch(() => {});
+      return true;
     })) continue;
 
     // Clicking Weiter here raises the Touch ID sheet — the one step only the
     // human can finish.
     if (/confirm-passkey/.test(u) && await once('confirm', async () => {
       const n = p.getByRole('button', { name: /^Weiter$|^Continue$/i }).first();
-      if (await n.count().catch(() => 0)) await n.click({ timeout: 8000 }).catch(() => {});
+      if (!await n.count().catch(() => 0)) return false;
+      await n.click({ timeout: 8000 }).catch(() => {});
+      return true;
     })) continue;
 
     if (/login-password/.test(u) && await once('offer-passkey', async () => {
       const b = p.getByRole('button', { name: /Mit Passkey anmelden|passkey/i }).first();
-      if (await b.count().catch(() => 0)) await b.click({ timeout: 8000 }).catch(() => {});
+      if (!await b.count().catch(() => 0)) return false;
+      await b.click({ timeout: 8000 }).catch(() => {});
+      return true;
     })) continue;
   }
   return 'login_required';
@@ -1422,7 +1477,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       }
       const apiLetters = await apiListLetters(200);
       if (!apiLetters && args.letter_id) {
-        return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'address the letter by index to use the portal instead' });
+        return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'address the letter by index to use the portal instead' });
       }
       if (apiLetters) {
         const l = args.letter_id ? apiLetters.find(x => x.id === args.letter_id) : apiLetters[args.index];
@@ -1474,7 +1529,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const letters = await apiListLetters(200);
         if (!letters && args.letter_id) {
-          return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'address the letter by index or title to use the portal instead' });
+          return text({ error: 'letter_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'address the letter by index or title to use the portal instead' });
         }
         if (letters) {
           const l = args.letter_id ? letters.find(x => x.id === args.letter_id)
@@ -1504,7 +1559,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_search') {
       const res = await apiSearch(args.keyword, args.location || 'ALL', args.limit || 50);
-      if (!res) return text({ error: 'search needs the API', hint: apiUnavailable || 'configure an API password or key' });
+      if (!res) return text({ error: 'search needs the API', hint: apiWhy() || 'configure an API password or key' });
       const items = Array.isArray(res) ? res : (res.letters || res.content || []);
       // A full page of matches is not "these are all the matches", and the
       // difference decides whether a caller concludes a letter does not exist.
@@ -1516,28 +1571,28 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     }
     if (name === 'epost_get_letter') {
       const l = await apiGetLetter(args.letter_id);
-      if (!l) return text({ error: 'not found, or the API is unavailable', hint: apiUnavailable });
+      if (!l) return text({ error: 'not found, or the API is unavailable', hint: apiWhy() });
       return text({ transport: 'api', ...apiLetterRow(l, 0), raw: l });
     }
     if (name === 'epost_unread_count') {
       const c = await apiUnreadCount();
-      if (c === null) return text({ error: 'needs the API', hint: apiUnavailable });
+      if (c === null) return text({ error: 'needs the API', hint: apiWhy() });
       return text({ transport: 'api', unread: typeof c === 'object' ? (c.count ?? c.unreadCount ?? c) : c });
     }
     if (name === 'epost_set_read_status') {
       const ok = await apiSetRead(args.letter_ids, args.status);
       return text(ok ? { transport: 'api', updated: args.letter_ids.length, status: args.status }
-        : { error: 'needs the API', hint: apiUnavailable });
+        : { error: 'needs the API', hint: apiWhy() });
     }
     if (name === 'epost_list_deleted') {
       const res = await apiDeletedLetters();
-      if (!res) return text({ error: 'needs the API', hint: apiUnavailable });
+      if (!res) return text({ error: 'needs the API', hint: apiWhy() });
       const items = Array.isArray(res) ? res : (res.letters || res.content || []);
       return text({ transport: 'api', count: items.length, letters: items });
     }
     if (name === 'epost_restore_letter') {
       const ok = await apiRestoreLetter(args.letter_id);
-      return text(ok ? { transport: 'api', restored: args.letter_id } : { error: 'needs the API', hint: apiUnavailable });
+      return text(ok ? { transport: 'api', restored: args.letter_id } : { error: 'needs the API', hint: apiWhy() });
     }
     if (name === 'epost_delete_letter') {
       // Deleting is the one irreversible-ish action here, and it is never the
@@ -1547,7 +1602,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       }
       const ok = await apiDeleteLetter(args.letter_id);
       return text(ok ? { transport: 'api', deleted: args.letter_id, note: 'recoverable with epost_restore_letter until it expires from the trash' }
-        : { error: 'needs the API', hint: apiUnavailable });
+        : { error: 'needs the API', hint: apiWhy() });
     }
     if (name === 'epost_download_thumbnail') {
       // Checked before anything else touches it: dirname() on a number throws
@@ -1556,7 +1611,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         throw new Error(`output_path must be a path, not ${typeof args.output_path}`);
       }
       const bytes = await apiThumbnail(args.letter_id);
-      if (!bytes) return text({ error: 'needs the API', hint: apiUnavailable });
+      if (!bytes) return text({ error: 'needs the API', hint: apiWhy() });
       mkdirSync(dirname(args.output_path), { recursive: true });
       // Any 200 used to count. A portal or proxy that answers with JSON or an
       // HTML error page was saved under the name of a thumbnail and reported as
@@ -1588,7 +1643,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       // folder, and the caller could not tell.
       if (args.folder_id) {
         const scoped = await apiArchiveWithFolders(1000);
-        if (!scoped) return text({ error: 'folder_id needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'drop folder_id to list the whole of Storage through the portal' });
+        if (!scoped) return text({ error: 'folder_id needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'drop folder_id to list the whole of Storage through the portal' });
       }
       const viaApi = args.folder_id
         ? await apiListArchive(args.folder_id, args.limit || 1000)
@@ -1626,7 +1681,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         ? await apiListArchive(args.folder_id, 1000)
         : await apiArchiveWithFolders(1000);
       if (!arch && apiOnly) {
-        return text({ error: 'this needs the public API and it is unavailable', hint: redact(apiUnavailable || 'configure an API password or key'), note: 'folder_id and letter_id cannot be honoured through the portal — drop them to read by position instead' });
+        return text({ error: 'this needs the public API and it is unavailable', hint: redact(apiWhy() || 'configure an API password or key'), note: 'folder_id and letter_id cannot be honoured through the portal — drop them to read by position instead' });
       }
       if (arch) {
         const items = Array.isArray(arch) ? arch : (arch.letters || arch.content || []);
@@ -1643,6 +1698,12 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           l.directoryNames = [(await apiListDirectories() || []).find(d => d.directoryId === args.folder_id)?.directoryName].filter(Boolean);
         }
         if (l) {
+          // Where the document actually sits in the listing this answer came
+          // from. A document addressed by id or by title used to be reported as
+          // `index: 0` — the position of a different document, and the handle
+          // every other tool takes, so filing "the one that was just read" by
+          // that index moved whatever happened to be first instead.
+          const pos = items.indexOf(l);
           let saved = null;
           if (args.output_dir) {
             const bytes = await apiLetterContent(l.id);
@@ -1657,9 +1718,9 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
           // Same rule as the browser path: asking for the file and being told
           // "ok" with nothing saved is a wrong answer about half the request.
           if (args.output_dir && !saved) {
-            return text({ transport: 'api', status: 'partial', ...apiLetterRow(l, args.index ?? 0), saved: null, error: 'the document content could not be fetched — the metadata below was read, the file was not saved' });
+            return text({ transport: 'api', status: 'partial', ...apiLetterRow(l, pos), saved: null, error: 'the document content could not be fetched — the metadata below was read, the file was not saved' });
           }
-          return text({ transport: 'api', ...apiLetterRow(l, args.index ?? 0), saved });
+          return text({ transport: 'api', ...apiLetterRow(l, pos), saved });
         }
       }
       const out = await readStorageDocument(await p(), { index: args.index, title: args.title, outputDir: args.output_dir });

@@ -470,6 +470,53 @@ describe('the API answering no', () => {
     assert.equal(data.id, 'arch-1', 'the metadata half is still reported');
   });
 
+  test('a folder that cannot be listed is not folded into "in no folder"', async () => {
+    // The archive listing carries no folder field, so membership is derived by
+    // asking each folder what it holds. A folder that fails to answer leaves
+    // the documents it would have named UNKNOWN — which is the opposite of
+    // unfiled, and a caller acting on the difference re-files the archive.
+    // Both used to arrive as a missing storedIn, because null and undefined
+    // were run through the same ?? chain.
+    const whole = await s.call('epost_list_storage_documents');
+    const unfiled = whole.data.documents.find(d => d.id === 'arch-2');
+    assert.equal(unfiled.storedIn, null,
+      `a document known to be in no folder must say so, not stay silent: ${JSON.stringify(unfiled)}`);
+
+    m.state.failDirectoryId = 'dir-two';
+    const partial = await s.call('epost_list_storage_documents');
+    m.state.failDirectoryId = null;
+    const unknown = partial.data.documents.find(d => d.id === 'arch-3');
+    assert.ok(!('storedIn' in unknown),
+      `a membership nobody could look up was reported anyway: ${JSON.stringify(unknown)}`);
+    assert.notEqual(JSON.stringify(unknown), JSON.stringify({ ...unknown, storedIn: unfiled.storedIn }),
+      'a folder that could not be listed reads exactly like a document in no folder');
+  });
+
+  test('a document addressed by id reports where it actually sits', async () => {
+    // index is the handle the other Storage tools take. This answered 0
+    // whatever was asked for, so filing "the one that was just read" by that
+    // index moved whichever document happened to be first instead.
+    const listed = await s.call('epost_list_storage_documents');
+    const want = listed.data.documents.find(d => d.id === 'arch-3');
+    assert.equal(want.index, 2, 'the fixture is supposed to put arch-3 third');
+    const { data } = await s.call('epost_read_storage_document', { letter_id: 'arch-3' });
+    assert.equal(data.id, 'arch-3');
+    assert.equal(data.index, want.index, 'it reported another document\'s position');
+  });
+
+  test('a letter that does not exist is the API answering, not the API being down', async () => {
+    // A 404 means the service was reached, authenticated and asked. Recording
+    // it as unavailability made epost_settings report the whole API as broken
+    // until some later call happened to succeed.
+    await s.call('epost_unread_count');
+    const nope = await s.call('epost_get_letter', { letter_id: 'no-such-letter' });
+    assert.match(nope.data.error, /not found/);
+    assert.match(nope.data.hint, /404/, 'the reason is still passed on to the caller');
+    const { data } = await s.call('epost_settings');
+    assert.doesNotMatch(data.api, /unavailable/, `a 404 was read as the API being down: ${data.api}`);
+    assert.match(data.api, /password grant/);
+  });
+
   test('a letter listing that fails is not read as an empty inbox', async () => {
     // The folders came back and the letters did not, so the id cannot be
     // resolved. This used to fall through to the portal, which addresses
