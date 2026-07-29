@@ -80,7 +80,12 @@ const loginEmailPage = () => `<!doctype html><html><head><meta charset="utf-8"><
 </body></html>`;
 
 export function start() {
-  const state = { stored: [], moved: [], detailOpened: [], created: [], loginFlow: false, loginEmails: [] };
+  // refuseCommit: the folder sheet is pressed and the portal says no. It says it
+  // by leaving the sheet standing — there is no other signal, exactly as with a
+  // duplicate folder name — and nothing here could produce that before, so the
+  // half of the store flow that has to notice went untested while it reported
+  // every letter as archived.
+  const state = { stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, loginFlow: false, loginEmails: [] };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
 <body>
@@ -108,8 +113,12 @@ ${sheet()}
       .filter(c => c.querySelector('.ui-chkbox-box').classList.contains('ui-state-active'))
       .map(c => c.querySelector('span').textContent);
     if (!on.length) return;                       // the portal refuses an empty set
-    fetch('/committed?i=' + current + '&f=' + encodeURIComponent(on.join('|')));
-    closeSheet();
+    // The sheet closes because the portal ACCEPTED it, and it stays open when
+    // the portal did not. Closing regardless made "clicked Store" and "the
+    // letter is in the folder" the same page state, so the one signal a caller
+    // has that an archive happened could never be wrong here — see refuseCommit.
+    fetch('/committed?i=' + current + '&f=' + encodeURIComponent(on.join('|')))
+      .then(function (r) { if (r.ok) closeSheet(); });
   }
   function openDetail(i){
     fetch('/detail?i=' + i);
@@ -133,6 +142,7 @@ ${sheet()}
   const srv = createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     if (u.pathname === '/committed') {
+      if (state.refuseCommit) { res.writeHead(409); return res.end(); }
       state.stored.push({ i: Number(u.searchParams.get('i')), folders: (u.searchParams.get('f') || '').split('|') });
       res.writeHead(204); return res.end();
     }

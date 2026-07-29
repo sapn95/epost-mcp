@@ -125,7 +125,16 @@ export function start() {
         sent: { password: state.echoPassword, authorization: `Bearer ${state.echoToken}` },
       });
     }
-    if (p === '/epost/v2/letters' && req.method === 'GET') return send(200, state.inbox);
+    // `limit` is honoured, because the server's own answers turn on it: it asks
+    // for a window and then reads the edge of that window as the edge of the
+    // letterbox. A mock that handed back everything however little was asked for
+    // could not produce a full page at all, so the difference between "the letter
+    // is not in the inbox" and "the letter was not in this answer" was untestable
+    // — and both came out as the former.
+    if (p === '/epost/v2/letters' && req.method === 'GET') {
+      const n = Number(url.searchParams.get('limit'));
+      return send(200, n > 0 ? state.inbox.slice(0, n) : state.inbox);
+    }
     if (p === '/epost/v2/letters/deleted') return send(200, state.deleted);
     if (p === '/epost/v2/letters/inbox/count') return send(200, { count: state.inbox.filter(l => l.readStatus === 'UNREAD').length });
     if (p === '/epost/v2/letters/search') {
