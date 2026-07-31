@@ -1435,8 +1435,25 @@ async function readStorageDocument(p, { index, title, outputDir }) {
 
   await card.scrollIntoViewIfNeeded().catch(() => {});
   // The click target is the card body; the outer wrapper does not carry it.
+  //
+  // Swallowed, like the same click in storeLetter, moveToFolder and
+  // createFolder, and for the reason 7ae4706 gave when it taught the other two:
+  // Playwright waits for the page to settle after a click and gives up at its
+  // own timeout, so a portal that goes back to the server to build the viewer
+  // lands the click, opens the panel, and still throws. Opening a Storage card
+  // IS such a trip — the viewer's contents are not on the page until the portal
+  // sends them, which is why this used to sleep three and a half seconds after
+  // it. That commit gave this function the honest evidence directly below (the
+  // detail's own wording, rendered) and left the unguarded click standing in
+  // front of it, exactly the arrangement it had just removed from the other
+  // two: the wait can never be reached, because the throw leaves first. Proven
+  // against a fixture whose card click kicks off a postback answered late — the
+  // panel was open, the portal had recorded the request, and the caller got
+  // `ERROR: locator.click: Timeout 10000ms exceeded` with every field of a
+  // reading that was sitting there for the taking. The click's own outcome
+  // says nothing about the viewer; the viewer does.
   const body = card.locator('.letter-content').first();
-  await (await body.count() ? body : card).click({ timeout: 10000 });
+  await (await body.count() ? body : card).click({ timeout: 10000 }).catch(() => {});
   // Clicking a card is not opening it, and nothing below ever checked. The
   // viewer lives in the DOM the whole time and is only toggled hidden, the way
   // this portal builds every panel — the same thing that let storeLetter read a

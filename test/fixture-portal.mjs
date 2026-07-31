@@ -79,6 +79,12 @@ const LOGIN_FIELD_DELAY = 3000;
 // the click rather than off the page could not be caught throwing away a change
 // the portal had already taken.
 const POSTBACK_DELAY = 9000;
+
+// The same thing one panel over, and longer because the click it has to outlast
+// is longer: opening a Storage card is a trip to the server — the viewer's
+// contents are not on the page until the portal sends them — and the automation
+// allows that click ten seconds. Nine would have gone through unnoticed.
+const DETAIL_POSTBACK_DELAY = 13000;
 const loginEmailPage = () => `<!doctype html><html><head><meta charset="utf-8"><title>login-email</title></head>
 <body><h1>SwissID</h1><div id="form"></div>
 <script>
@@ -119,6 +125,15 @@ export function start() {
   // the page. Two of the three two-step flows did, and threw away the very
   // signal they had just been given.
   //
+  // slowDetail: the card click opens the viewer AND kicks off a trip to the
+  // server the portal is slow to answer — the shape slowPostback already has
+  // for the two confirm buttons, one panel over. The panel is open before the
+  // navigation starts and the portal has recorded the request, so everything
+  // the read needs is on the page; all that is left waiting is the click, which
+  // gives up at its own timeout and throws. Nothing here could produce it, so
+  // the one click still standing unguarded in front of an honest wait could not
+  // be caught losing a reading the portal had already served.
+  //
   // detailStuck: the card is clicked and the document viewer does not open —
   // the same accident as sheetStuck, one panel over. A stale view, a re-render
   // that replaced the handler, a session that lapsed while the list was on
@@ -131,7 +146,7 @@ export function start() {
   const state = {
     stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false,
     loginFlow: false, loginEmails: [], commitDelayMs: 0, createDelayMs: 0, slowPostback: false,
-    detailStuck: false, detailOverlay: false,
+    detailStuck: false, detailOverlay: false, slowDetail: false,
   };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
@@ -144,6 +159,7 @@ ${sheet()}
   const SHEET_STUCK = ${state.sheetStuck};
   const SLOW_POSTBACK = ${state.slowPostback};
   const DETAIL_STUCK = ${state.detailStuck};
+  const SLOW_DETAIL = ${state.slowDetail};
   // The portal's own trip back to the server after a confirm. It has already
   // taken the change; this is only the repaint, and it answers 204 so the page
   // stays put. All it does is leave the click waiting — see POSTBACK_DELAY.
@@ -185,6 +201,10 @@ ${sheet()}
     if (DETAIL_STUCK) return;
     fetch('/detail?i=' + i);
     document.getElementById('detail').style.display='block';
+    // The panel is up and the request is recorded BEFORE this: the portal has
+    // served the document, and the only thing still outstanding is the repaint
+    // it goes back to the server for. See state.slowDetail.
+    if (SLOW_DETAIL) location.href = '/slow-detail';
   }
   // Escape dismisses the viewer, which is what the automation presses after
   // every read and every download and had nothing to press against here. It
@@ -231,6 +251,10 @@ ${sheet()}
     // that started this is left waiting. See POSTBACK_DELAY.
     if (u.pathname === '/slow-postback') {
       return setTimeout(() => { res.writeHead(204); res.end(); }, POSTBACK_DELAY);
+    }
+    // The card click's own repaint, answered late — see DETAIL_POSTBACK_DELAY.
+    if (u.pathname === '/slow-detail') {
+      return setTimeout(() => { res.writeHead(204); res.end(); }, DETAIL_POSTBACK_DELAY);
     }
     if (u.pathname === '/committed') {
       if (state.refuseCommit) { res.writeHead(409); return res.end(); }
