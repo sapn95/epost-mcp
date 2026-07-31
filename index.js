@@ -919,7 +919,18 @@ async function createFolder(p, name) {
   await input.fill(name, { timeout: 8000 });
   await p.waitForTimeout(400);
   const createBtn = p.locator('[id$=":create-btn"]').first();
-  if (await createBtn.count()) await createBtn.click({ timeout: 8000, force: true });
+  // The click's own outcome says nothing about the folder, and it was allowed to
+  // answer for it. Playwright waits for the page to settle after a click and
+  // gives up at its own timeout, so a portal that goes back to the server for a
+  // repaint lands the click, takes the name, and still throws here — which left
+  // through the outer catch as `ERROR: locator.click: Timeout 8000ms exceeded`
+  // for a folder that now exists. Creating it again is precisely what the portal
+  // then refuses, which is the trap the wait below was written to avoid, so this
+  // did not merely mislead the caller once. storeLetter has discarded its confirm
+  // click for this reason since the round that gave it a sheet to read instead;
+  // the round that gave THIS one a dialog to read left the click standing in
+  // front of it, where it never gets there.
+  if (await createBtn.count()) await createBtn.click({ timeout: 8000, force: true }).catch(() => {});
   else await p.keyboard.press('Enter');
   // Clicking is not creating. A duplicate name, or one the portal will not
   // accept, leaves the dialog open with its complaint in it — and this reported
@@ -1056,7 +1067,16 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   // lag behind the real state once a folder is ticked, so force the click).
   const confirmBtn = p.locator('[id$=":moveBtn"]').first();
   if (!(await confirmBtn.count())) throw new Error('move confirm button (:moveBtn) not found');
-  await confirmBtn.click({ timeout: 8000, force: true });
+  // Swallowed, like the same click in storeLetter and for the same reason: a
+  // click that landed perfectly well still throws when the portal is slow to
+  // settle afterwards, because Playwright waits for that settle and gives up at
+  // the timeout. Proven against the fixture with a postback that answers late —
+  // the move was recorded, the sheet closed, and the caller got `ERROR:
+  // locator.click: Timeout 8000ms exceeded` about a document that had moved.
+  // The wait below is the honest signal and it is new; leaving the click
+  // unguarded in front of it meant the flow could not reach the very evidence it
+  // had just been given.
+  await confirmBtn.click({ timeout: 8000, force: true }).catch(() => {});
   await p.waitForTimeout(1500);
 
   // Some moves raise a confirmation popup — accept it best-effort if present.
@@ -1417,7 +1437,37 @@ async function readStorageDocument(p, { index, title, outputDir }) {
   // The click target is the card body; the outer wrapper does not carry it.
   const body = card.locator('.letter-content').first();
   await (await body.count() ? body : card).click({ timeout: 10000 });
-  await p.waitForTimeout(3500);
+  // Clicking a card is not opening it, and nothing below ever checked. The
+  // viewer lives in the DOM the whole time and is only toggled hidden, the way
+  // this portal builds every panel — the same thing that let storeLetter read a
+  // sheet which had never appeared — and innerText on an element that is NOT
+  // being rendered falls back to its text content, so the panel's own wording
+  // is findable in a panel nobody opened. So a stale view, a lapsed session or
+  // a re-render that replaced the handler produced `status: ok` with the
+  // hidden detail's folder in it: proven against the fixture, a document filed
+  // in one folder reported as being in the one the closed panel happens to
+  // name, with a neighbouring card's "Stored in …" tag scraped up as its
+  // subject. Every field of that answer is a guess and none of it says so.
+  //
+  // Waited for rather than slept through, for the reason the last round gave
+  // for the folder sheet: a portal taking its time is not a portal that failed,
+  // and three and a half seconds was both too long for a quick one and too
+  // short for a loaded machine. "Document type" is the anchor the folder lookup
+  // below already trusts as detail-only, and body.innerText is the rendered
+  // text, so a hidden panel cannot satisfy it.
+  const opened = await p.waitForFunction(
+    () => /Document type/i.test(document.body.innerText), null, { timeout: 15000 },
+  ).then(() => true).catch(() => false);
+  if (!opened) {
+    await p.keyboard.press('Escape').catch(() => {});
+    return {
+      status: 'refused',
+      index,
+      title,
+      error: 'the document viewer did not open — nothing was read',
+      hint: 'the Storage list may be stale; re-list with epost_list_storage_documents and address the document again',
+    };
+  }
 
   const meta = await p.evaluate(() => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -1446,8 +1496,18 @@ async function readStorageDocument(p, { index, title, outputDir }) {
         // .storage-location-info, and visibility does not separate them
         // because the panel covers them rather than hiding them. So: the
         // smallest element that contains both, and its folder.
+        //
+        // Rendered, though — which the sentence above promised and the filter
+        // never asked for. innerText on an element that is not being rendered
+        // is its text content, so a panel that never opened matches this test
+        // perfectly and is the SHORTEST match there is, being the only one
+        // holding nothing but a detail. A folder was then reported for a
+        // document that is filed somewhere else entirely. The wait above is
+        // what stops that happening at all; this is the same lesson where the
+        // reading is actually done.
         const scope = [...document.querySelectorAll('div, section, article, main')]
-          .filter(n => n.querySelector('.storage-location-info') && /Document type/i.test(n.innerText || ''))
+          .filter(n => n.offsetParent !== null
+            && n.querySelector('.storage-location-info') && /Document type/i.test(n.innerText || ''))
           .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
         const el = (scope || document).querySelector('.storage-location-info');
         if (el) return clean(el.innerText).replace(/^Stored in\s*/i, '') || null;
@@ -1818,6 +1878,20 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             // One question, one answer, whatever the inbox happens to be.
             let refused = null;
             const filed = await apiArchiveLetter(l.id, dir.directoryId).catch(e => { refused = e; return false; });
+            // Whether the SERVICE answered, rather than whether it threw. Only
+            // some of its noes arrive as a throw: withApi rethrows a 4xx so the
+            // tool can report it, but it makes an exception of 404 and turns
+            // that one into a null with the reason in apiRefusal — which is the
+            // very distinction this round's own apiEmptyHanded was written to
+            // respect, "the service being reached and answering not here", for
+            // calls that carry the letter id IN THEIR URL. The archive PATCH
+            // carries it too. So `refused` alone missed exactly one of the two
+            // shapes a no comes in, and the 404 went out through the
+            // fall-through below to be tried a second way by position. A null
+            // with apiUnavailable still clear is that 404 and nothing else:
+            // every other way out of withApi that returns null sets it, and a
+            // call that worked would have cleared apiRefusal on its way past.
+            const answeredNo = !!refused || (!filed && !apiUnavailable);
             if (filed) {
               await saveState();
               return text({ transport: 'api', stored: l.description || l.letterTitle, folder: dir.directoryName, id: l.id });
@@ -1856,13 +1930,18 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
             // necessarily the letter the service just refused — it would go and
             // archive a different one and report `status: ok`. The
             // fall-through below stays for the case it was written for: a
-            // service that could not answer at all.
-            if (args.letter_id || refused) {
+            // service that could not answer at all. And the 404 was in the
+            // fall-through with it, because "answered no" was read off the
+            // throw — see answeredNo above. A 400 addressed by index was
+            // reported and a 404 addressed by index went to the portal, which
+            // is one question with two answers depending on which word the
+            // service happened to refuse in.
+            if (args.letter_id || answeredNo) {
               return text({
                 error: `letter ${args.letter_id || l.id} could not be archived`,
                 hint: redact(refused?.message || apiWhy() || 'the API listed the inbox but would not file the letter'),
-                note: refused
-                  ? 'nothing was filed; the service refused this outright, so it was not attempted a second way through the portal'
+                note: answeredNo
+                  ? 'nothing was filed; the service was reached and would not, so it was not attempted a second way through the portal'
                   : 'nothing was filed; the portal addresses letters by position and cannot be asked for an id — re-list and pass index or title instead',
               });
             }

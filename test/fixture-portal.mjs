@@ -58,7 +58,7 @@ const sheet = () => `
       </div>`).join('')}
   </div>
   <button id="f:cancel" onclick="closeSheet()">Cancel</button>
-  <button id="f:moveBtn" onclick="commit()">Store</button>
+  <button id="f:moveBtn" onclick="commit();postback()">Store</button>
 </div>`;
 
 // The one step of the SwissID chain that can be reproduced without SwissID: a
@@ -67,6 +67,18 @@ const sheet = () => `
 // supposed to look more than once. Served only while state.loginFlow is on, so
 // the tests that want the dashboard still get one.
 const LOGIN_FIELD_DELAY = 3000;
+
+// How long the portal takes to answer the postback a confirm click kicks off.
+// Deliberately longer than the eight seconds the automation allows that click,
+// because the point is a click that LANDED and throws anyway: Playwright waits
+// for the page to settle after a click and gives up at its own timeout, which is
+// the entire reason storeLetter discards its confirm click's outcome and reads
+// the sheet instead. The response is a 204, so the page never actually leaves —
+// only the click is left waiting, exactly as with a real repaint that is slow to
+// come back. Nothing here could produce it, so the two siblings that decide off
+// the click rather than off the page could not be caught throwing away a change
+// the portal had already taken.
+const POSTBACK_DELAY = 9000;
 const loginEmailPage = () => `<!doctype html><html><head><meta charset="utf-8"><title>login-email</title></head>
 <body><h1>SwissID</h1><div id="form"></div>
 <script>
@@ -100,9 +112,26 @@ export function start() {
   // a refusing one, and two of the three two-step flows decide between them
   // with a flat waitForTimeout, so a move that had gone through came back as
   // "refused, nothing was changed". Nothing here could be slow before.
+  //
+  // slowPostback: the confirm click also kicks off a navigation the portal is
+  // slow to answer — see POSTBACK_DELAY. The change is taken either way; what
+  // differs is whether the automation lets the click's own timeout answer for
+  // the page. Two of the three two-step flows did, and threw away the very
+  // signal they had just been given.
+  //
+  // detailStuck: the card is clicked and the document viewer does not open —
+  // the same accident as sheetStuck, one panel over. A stale view, a re-render
+  // that replaced the handler, a session that lapsed while the list was on
+  // screen: the click lands on nothing and the page is exactly as it was. It
+  // matters because the detail panel is in the DOM the whole time, hidden, and
+  // innerText on an element that is NOT being rendered falls back to its text
+  // content — so a scan for the panel's own wording finds it in a panel nobody
+  // opened. Nothing here could produce it, so the read could never be caught
+  // answering out of a detail that was never on screen.
   const state = {
     stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false,
-    loginFlow: false, loginEmails: [], commitDelayMs: 0, createDelayMs: 0,
+    loginFlow: false, loginEmails: [], commitDelayMs: 0, createDelayMs: 0, slowPostback: false,
+    detailStuck: false,
   };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
@@ -113,6 +142,12 @@ ${sheet()}
 <script>
   // Read at render time, so a test flips it and the next reload gets it.
   const SHEET_STUCK = ${state.sheetStuck};
+  const SLOW_POSTBACK = ${state.slowPostback};
+  const DETAIL_STUCK = ${state.detailStuck};
+  // The portal's own trip back to the server after a confirm. It has already
+  // taken the change; this is only the repaint, and it answers 204 so the page
+  // stays put. All it does is leave the click waiting — see POSTBACK_DELAY.
+  function postback(){ if (SLOW_POSTBACK) location.href = '/slow-postback'; }
   let current = null;
   function store(i){
     current = i;
@@ -145,6 +180,9 @@ ${sheet()}
       .then(function (r) { if (r.ok) closeSheet(); });
   }
   function openDetail(i){
+    // A click that lands on nothing: the handler is gone, the panel stays
+    // hidden and the page is exactly as it was. See state.detailStuck.
+    if (DETAIL_STUCK) return;
     fetch('/detail?i=' + i);
     document.getElementById('detail').style.display='block';
   }
@@ -165,6 +203,11 @@ ${sheet()}
 
   const srv = createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
+    // A 204 aborts the navigation, so the page never leaves and only the click
+    // that started this is left waiting. See POSTBACK_DELAY.
+    if (u.pathname === '/slow-postback') {
+      return setTimeout(() => { res.writeHead(204); res.end(); }, POSTBACK_DELAY);
+    }
     if (u.pathname === '/committed') {
       if (state.refuseCommit) { res.writeHead(409); return res.end(); }
       // Recorded before the delay: the portal has taken the change, it is the
@@ -206,7 +249,7 @@ ${sheet()}
          <div id="newfolder" style="display:none">
            <input type="text" id="dlg:folder-name">
            <button id="dlg:create-btn"
-             onclick="fetch('/created?n=' + encodeURIComponent(document.getElementById('dlg:folder-name').value)).then(r => { if (r.ok) { document.getElementById('newfolder').style.display='none'; } else { document.getElementById('newfolder-msg').textContent = 'A folder with this name already exists'; } })">Create</button>
+             onclick="fetch('/created?n=' + encodeURIComponent(document.getElementById('dlg:folder-name').value)).then(r => { if (r.ok) { document.getElementById('newfolder').style.display='none'; } else { document.getElementById('newfolder-msg').textContent = 'A folder with this name already exists'; } }); postback()">Create</button>
            <div id="newfolder-msg"></div>
          </div>
          <h3>Companies (1)</h3><div class="tile"><span>ePost Scancenter</span> <span>3 Files</span></div>
