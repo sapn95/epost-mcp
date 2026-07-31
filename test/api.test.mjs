@@ -853,6 +853,44 @@ describe('the API answering no', () => {
     }
   });
 
+  test('and a 404 is a refusal too, whichever way the letter was named', async () => {
+    // The two tests above were written in the same round and never crossed:
+    // one tried 503 and 404 with a letter_id, the other tried 400 with an index
+    // and a title. Nobody tried 404 with an index, and that is the one square
+    // the fix did not cover — because "the service answered no" was read off
+    // the THROW, and only some of its noes throw. withApi rethrows a 4xx so the
+    // tool can report it and makes an exception of 404, turning that one into a
+    // null with the reason in apiRefusal. The same round's own apiEmptyHanded
+    // exists to say that this null is the service "being reached and answering
+    // not here" for any call carrying the letter id in its URL, and the archive
+    // PATCH carries it. So the identical situation came back as a sentence when
+    // the service said 400 and as a browser launch when it said 404 — which
+    // then archives whatever sits at that position in a list the portal numbers
+    // differently, and reports it as done.
+    for (const sel of [{ index: 0 }, { title: 'inbox-2' }]) {
+      const how = JSON.stringify(sel);
+      m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-1/archive', status: 404 });
+      m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-2/archive', status: 404 });
+      const { raw, data } = await s.call('epost_store_letter', { ...sel, folder: 'Example_Alpha' });
+      m.state.forceStatus.length = 0;
+      assert.doesNotMatch(raw, /needs the browser|EPOST_TRANSPORT/,
+        `${how}: a 404 the service answered was handed to the portal to try again: ${raw.slice(0, 200)}`);
+      assert.match(data.error || raw, /could not be archived/, `${how}: ${raw.slice(0, 200)}`);
+      assert.match(data.hint || raw, /404/, `${how}: the answer the service gave is passed on`);
+      assert.match(data.note || raw, /nothing was filed/, `${how}: ${raw.slice(0, 200)}`);
+      assert.ok(m.state.inbox.some(l => l.id === 'inbox-1'), `${how}: the letter left the inbox anyway`);
+    }
+    // The other branch is unchanged: a service that could not answer AT ALL is
+    // still worth a second try by a position the portal can resolve, and the
+    // 503 above is that case. Losing it would turn one wrong answer into the
+    // opposite one.
+    m.state.forceStatus.push({ path: '/epost/v2/letters/inbox-1/archive', status: 503 });
+    const { raw } = await s.call('epost_store_letter', { index: 0, folder: 'Example_Alpha' });
+    m.state.forceStatus.length = 0;
+    assert.match(raw, /needs the browser|EPOST_TRANSPORT/,
+      `a position the portal can resolve was refused for an API that never answered: ${raw.slice(0, 200)}`);
+  });
+
   test('an id the service has never heard of is not a broken transport', async () => {
     // ed6806d taught the two folder-scoped guards that withApi's null means two
     // things and that a 404 is not "the API is unavailable" — it is the service

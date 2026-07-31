@@ -294,6 +294,33 @@ describe('portal automation', () => {
       'the folder must come from the open detail, not from a card behind it');
   });
 
+  test('a viewer that never opened is not a document that was read', SLOW, async () => {
+    // The click was the whole of the evidence. Nothing below it looked at the
+    // page again, and the panel it was supposed to open lives in the DOM the
+    // entire time, hidden — the same PrimeFaces habit that let a store read a
+    // sheet which had never appeared. innerText on an element that is not being
+    // RENDERED falls back to its text content, so the folder lookup, whose own
+    // comment says it must find a visible one, matched the closed panel: it is
+    // the shortest thing on the page holding both a "Document type" and a
+    // "Stored in", precisely because nothing else is in it. So this document —
+    // filed in Example_Alpha — came back `status: ok` with storedIn
+    // Example_Beta, which is the panel's folder and no document's on this page,
+    // and with a neighbour's "Stored in Example_Ümlaut" scraped up as its
+    // subject. A wrong answer in every field and confident in all of them.
+    portal.state.detailStuck = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_read_storage_document', { index: 0 });
+      assert.ok(isError || data.status === 'refused',
+        `a document nobody opened was reported as read: ${raw.slice(0, 200)}`);
+      assert.match(raw, /did not open|nothing was read/,
+        `it does not say the viewer never opened: ${raw.slice(0, 200)}`);
+      assert.ok(!/Example_Beta/.test(raw),
+        `the closed panel answered for the document anyway: ${raw.slice(0, 200)}`);
+    } finally {
+      portal.state.detailStuck = false;
+    }
+  });
+
   test('a Storage document addressed by title is saved under a name of its own', SLOW, async () => {
     // Title-addressed downloads were all named "..._x.pdf", so two documents
     // with the same date quietly overwrote each other. The card's position is
@@ -349,6 +376,48 @@ describe('portal automation', () => {
     } finally {
       portal.state.commitDelayMs = 0;
       portal.state.createDelayMs = 0;
+    }
+  });
+
+  test('a move the portal took is not undone by the click that made it', SLOW, async () => {
+    // Round 17 gave epost_move_to_folder something real to read — the sheet
+    // going away — instead of a flat sleep. It never got there. The confirm
+    // click in front of that wait was left to answer for the page, and
+    // storeLetter's own comment says why that cannot work: "Playwright waits for
+    // the page to settle afterwards and gives up at the timeout, so on a loaded
+    // machine a click that landed perfectly well still throws". A portal that
+    // goes back to the server for a repaint does exactly that. The change was
+    // taken, the sheet closed, and the caller was handed `ERROR: locator.click:
+    // Timeout 8000ms exceeded` about a document that had moved. storeLetter,
+    // driving this very sheet, has discarded its own confirm click since the
+    // round that gave it the sheet to read, and answers `status: ok` under
+    // exactly this condition — which is what makes this a sibling nobody taught
+    // rather than a hazard the file had never met.
+    const before = portal.state.stored.length;
+    portal.state.slowPostback = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_move_to_folder', { index: 1, folder: 'Example_Gamma' });
+      assert.equal(portal.state.stored.length, before + 1, 'the fixture is supposed to accept this move');
+      assert.ok(!isError, `a move the portal took came back as a failure: ${raw.slice(0, 200)}`);
+      assert.ok(data.moved, `it was not reported as a move at all: ${raw.slice(0, 200)}`);
+    } finally {
+      portal.state.slowPostback = false;
+    }
+  });
+
+  test('and neither is a folder the portal created', SLOW, async () => {
+    // The same click, the same postback, in the sibling that decides the same
+    // way. This one costs the caller twice: told the folder does not exist, they
+    // create it again, and creating it again is precisely what the portal
+    // refuses as a duplicate — the trap the dialog wait was written to avoid.
+    portal.state.slowPostback = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_create_folder', { name: 'Postback_Angelegt' });
+      assert.ok(portal.state.created.includes('Postback_Angelegt'), 'the fixture is supposed to accept this name');
+      assert.ok(!isError, `a folder the portal created came back as a failure: ${raw.slice(0, 200)}`);
+      assert.equal(data.status, 'ok', `it was not reported as created: ${raw.slice(0, 200)}`);
+    } finally {
+      portal.state.slowPostback = false;
     }
   });
 
