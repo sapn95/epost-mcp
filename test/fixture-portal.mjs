@@ -131,7 +131,7 @@ export function start() {
   const state = {
     stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false,
     loginFlow: false, loginEmails: [], commitDelayMs: 0, createDelayMs: 0, slowPostback: false,
-    detailStuck: false,
+    detailStuck: false, detailOverlay: false,
   };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
@@ -186,8 +186,32 @@ ${sheet()}
     fetch('/detail?i=' + i);
     document.getElementById('detail').style.display='block';
   }
+  // Escape dismisses the viewer, which is what the automation presses after
+  // every read and every download and had nothing to press against here. It
+  // matters now that the panel covers the page: without it the overlay from one
+  // letter would still be lying over the card of the next.
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') document.getElementById('detail').style.display='none';
+  });
 </script>
-<div id="detail" style="display:none">
+<!-- A fixed overlay, because that is what the automation says this panel is:
+     "the cards behind it all carry .storage-location-info, and visibility does
+     not separate them because the panel COVERS them rather than hiding them".
+     A panel that covers the page is out of the flow and pinned to the viewport,
+     which is how PrimeFaces builds a modal — and a fixed element's
+     offsetParent is null however plainly visible it is, exactly as if it were
+     not rendered at all. The panel was a plain static div here, so a filter
+     that reads offsetParent as "is this on screen" agreed with itself and the
+     folder lookup went on answering out of the detail. It answers out of the
+     first card instead the moment the panel is what the portal actually
+     serves.
+
+     Zugeschaltet statt immer an: ein Overlay, das den ganzen Bildschirm deckt,
+     bleibt nach einem Lesevorgang liegen und verdeckt die Karte, auf die der
+     nächste Test klicken will — sechzehn der dreissig Browser-Tests liefen so
+     in Klick-Timeouts. Die eine Prüfung, der die Form etwas bedeutet, schaltet
+     ihn ein. -->
+<div id="detail" style="display:none${state.detailOverlay ? ';position:fixed;top:0;left:0;right:0;bottom:0;background:#fff;z-index:9' : ''}">
   <!-- The sender begins with a C on purpose: the subject was once matched with
        a pattern that excluded that letter, so every such name came back null. -->
   <div>Gescannter Brief Invoice from Caramba Example AG CHF 42.00</div>

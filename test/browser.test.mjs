@@ -278,8 +278,13 @@ describe('portal automation', () => {
   });
 
   test('opening a Storage document reads its detail rather than the card', SLOW, async () => {
+    // The overlay is switched on for this one test and off again afterwards. It
+    // is the shape the portal really serves, but it covers the whole page, and
+    // a panel left lying there hides the card the next test wants to click.
+    portal.state.detailOverlay = true;
     const before = portal.state.detailOpened.length;
     const { data } = await srv.call('epost_read_storage_document', { index: 0 });
+    portal.state.detailOverlay = false;
     assert.ok(portal.state.detailOpened.length > before, 'the card body was clicked, not the wrapper');
     // The detail is the only place the real subject appears — the card shows
     // "Gescannter Brief" for everything — so reading it is the whole point.
@@ -290,6 +295,19 @@ describe('portal automation', () => {
     // Example_Beta is the DETAIL's folder; the cards behind it say Example_Alpha
     // and Example_Ümlaut. Taking the first .storage-location-info in the
     // document returns one of those instead.
+    //
+    // The panel is a fixed overlay for this test, which is what the reader's
+    // own comment has always said it is — it COVERS the cards — and it was a
+    // static div here, so the shape the portal actually serves was never
+    // driven. It
+    // matters because the guard the last round added to keep this answer out of
+    // a panel nobody opened asked offsetParent, and offsetParent is null for a
+    // fixed element however plainly visible: the detail was dropped from the
+    // candidates and the lookup fell back to the first .storage-location-info
+    // in the document, which is card 0's. Example_Alpha came back for a
+    // document whose open panel says Example_Beta, with every other field of
+    // the reply correct — the exact answer 36f1729 removed, restored by the
+    // guard against it.
     assert.equal(data.storedIn?.normalize('NFC'), 'Example_Beta',
       'the folder must come from the open detail, not from a card behind it');
   });
