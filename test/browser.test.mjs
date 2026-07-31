@@ -281,10 +281,18 @@ describe('portal automation', () => {
     // The overlay is switched on for this one test and off again afterwards. It
     // is the shape the portal really serves, but it covers the whole page, and
     // a panel left lying there hides the card the next test wants to click.
-    portal.state.detailOverlay = true;
+    // In a finally, like every other flag here. The call below can reject on
+    // the client's own timeout, and an overlay left switched on then takes the
+    // rest of the suite into click timeouts — which is the whole reason it is a
+    // flag rather than the fixture's permanent shape.
+    let data;
     const before = portal.state.detailOpened.length;
-    const { data } = await srv.call('epost_read_storage_document', { index: 0 });
-    portal.state.detailOverlay = false;
+    portal.state.detailOverlay = true;
+    try {
+      ({ data } = await srv.call('epost_read_storage_document', { index: 0 }));
+    } finally {
+      portal.state.detailOverlay = false;
+    }
     assert.ok(portal.state.detailOpened.length > before, 'the card body was clicked, not the wrapper');
     // The detail is the only place the real subject appears — the card shows
     // "Gescannter Brief" for everything — so reading it is the whole point.
@@ -336,6 +344,36 @@ describe('portal automation', () => {
         `the closed panel answered for the document anyway: ${raw.slice(0, 200)}`);
     } finally {
       portal.state.detailStuck = false;
+    }
+  });
+
+  test('a reading the portal served is not undone by the click that opened it', SLOW, async () => {
+    // 7ae4706 is called "a click that landed still throws". It taught
+    // epost_move_to_folder and epost_create_folder exactly that — Playwright
+    // waits for the page to settle after a click and gives up at its own
+    // timeout, so a portal that goes back to the server for a repaint lands the
+    // click, does the work, and throws anyway — and in the SAME commit it gave
+    // this function its first honest evidence, the detail's own wording in the
+    // rendered body, while leaving the unguarded click standing in front of it.
+    // That is precisely the arrangement it had just removed from the other two:
+    // the wait cannot be reached, because the throw leaves first. Opening a
+    // Storage card is such a trip in its own right — the viewer's contents are
+    // not on the page until the portal sends them, which is why this used to
+    // sleep three and a half seconds afterwards. So the panel was open, the
+    // portal had recorded the request, and the caller got `ERROR: locator.click:
+    // Timeout 10000ms exceeded` about a document whose every field was sitting
+    // there to be read.
+    const before = portal.state.detailOpened.length;
+    portal.state.slowDetail = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_read_storage_document', { index: 0 });
+      assert.ok(portal.state.detailOpened.length > before, 'the fixture is supposed to open the viewer');
+      assert.ok(!isError, `a document the portal opened came back as a failure: ${raw.slice(0, 200)}`);
+      assert.equal(data.status, 'ok', `it was not reported as read at all: ${raw.slice(0, 200)}`);
+      assert.equal(data.subject, 'Invoice from Caramba Example AG',
+        `the reading was lost with the click: ${raw.slice(0, 200)}`);
+    } finally {
+      portal.state.slowDetail = false;
     }
   });
 
