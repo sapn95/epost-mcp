@@ -1505,8 +1505,26 @@ async function readStorageDocument(p, { index, title, outputDir }) {
         // document that is filed somewhere else entirely. The wait above is
         // what stops that happening at all; this is the same lesson where the
         // reading is actually done.
+        //
+        // Asked as "does it have a box", not as offsetParent, which is what the
+        // round that added this filter used and is not the same question.
+        // offsetParent is a positioning API and it answers null for THREE
+        // different things: an element that is not rendered, the body — and any
+        // element whose position is fixed, however plainly visible it is. A
+        // panel that COVERS the cards is exactly that shape; it is how
+        // PrimeFaces builds a modal, and covering is what the paragraph above
+        // says this one does. The detail was then dropped from the candidates,
+        // the lookup fell through to the first .storage-location-info in the
+        // whole document, and that is a card's — the very answer 36f1729 was
+        // written to stop, restored by the guard meant to prevent it, silently
+        // and with every other field of the reply correct. Proven against a
+        // fixture whose viewer is a fixed overlay: a document whose open detail
+        // says Example_Beta came back Example_Alpha, the first card on the
+        // page. getClientRects is the question innerText's fallback actually
+        // turns on — no box, no rendering, textContent — and a fixed overlay
+        // has a box like anything else.
         const scope = [...document.querySelectorAll('div, section, article, main')]
-          .filter(n => n.offsetParent !== null
+          .filter(n => n.getClientRects().length > 0
             && n.querySelector('.storage-location-info') && /Document type/i.test(n.innerText || ''))
           .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
         const el = (scope || document).querySelector('.storage-location-info');
