@@ -25,6 +25,13 @@ before(async () => {
     EPOST_TRANSPORT: 'browser',
     EPOST_APP_URL: portal.base,
     EPOST_PROFILE: profile,
+    // The pauses in the automation are sized for the portal's repaints. This
+    // fixture has none worth waiting for, and waiting for them anyway was most
+    // of what a run of this file spent its time on. Overridable, because the
+    // number that is fast enough here is a property of the machine: a loaded
+    // one can lose the race the pauses exist to win, and a run that has to be
+    // slowed down is better than one that has to be believed.
+    EPOST_WAIT_SCALE: process.env.EPOST_WAIT_SCALE || '0.08',
     ...(existsSync(CHROME) ? { EPOST_BROWSER: CHROME } : {}),
   }, { timeout: 90000 });   // a browser launch plus navigation is not fast
 });

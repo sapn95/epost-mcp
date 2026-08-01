@@ -320,6 +320,7 @@ never removes an existing membership. Two consequences worth knowing:
 | `EPOST_API_BASE` | `https://api.epost.ch` | API host — overridable for tests |
 | `EPOST_APP_URL` | `https://app.epost.ch` | Portal base — overridable for tests |
 | `EPOST_DEBUG` | unset | `1` traces the login steps on stderr |
+| `EPOST_WAIT_SCALE` | `1` | Scales the fixed pauses that let the portal repaint, and nothing else — no timeout is derived from it. Only shortens: a value outside `(0, 1]` is read as a typo and ignored. Meant for the test suite, which drives a local DOM fixture that has nothing to repaint |
 
 The browser is resolved in that order deliberately: an installed, signed browser
 first, because only that one can reach the platform authenticator, and only then
