@@ -134,6 +134,15 @@ export function start() {
   // the one click still standing unguarded in front of an honest wait could not
   // be caught losing a reading the portal had already served.
   //
+  // slowDownload: pressing "Download File" serves the file AND sends the portal
+  // back to the server for a repaint it is slow to answer — the same shape one
+  // more panel over, and the one the two download paths had never been shown.
+  // The fixture's download is an `<a download>` with a data: URL, which starts
+  // no navigation at all, so a click here could never outlast its own file: the
+  // one place where the click's outcome is joined to the download's in a
+  // Promise.all, and therefore the one place where a click that landed can
+  // throw away a document the browser has already delivered.
+  //
   // detailStuck: the card is clicked and the document viewer does not open —
   // the same accident as sheetStuck, one panel over. A stale view, a re-render
   // that replaced the handler, a session that lapsed while the list was on
@@ -146,7 +155,7 @@ export function start() {
   const state = {
     stored: [], moved: [], detailOpened: [], created: [], refuseCommit: false, sheetStuck: false,
     loginFlow: false, loginEmails: [], commitDelayMs: 0, createDelayMs: 0, slowPostback: false,
-    detailStuck: false, detailOverlay: false, slowDetail: false,
+    detailStuck: false, detailOverlay: false, slowDetail: false, slowDownload: false,
   };
 
   const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>
@@ -160,6 +169,7 @@ ${sheet()}
   const SLOW_POSTBACK = ${state.slowPostback};
   const DETAIL_STUCK = ${state.detailStuck};
   const SLOW_DETAIL = ${state.slowDetail};
+  const SLOW_DOWNLOAD = ${state.slowDownload};
   // The portal's own trip back to the server after a confirm. It has already
   // taken the change; this is only the repaint, and it answers 204 so the page
   // stays put. All it does is leave the click waiting — see POSTBACK_DELAY.
@@ -240,8 +250,15 @@ ${sheet()}
        first .storage-location-info in the document reports that one instead,
        and a fixture where both say the same thing cannot tell the difference. -->
   <div class="storage-location-info"><span>Stored in </span> <b>Example_Beta</b></div>
-  <a id="dl" download="letter.pdf" href="data:application/pdf;base64,JVBERi0xLjQgbW9jaw==">Download File</a>
-  <button onclick="document.getElementById('dl').click()">Download File</button>
+  <!-- Both controls, because the two download paths reach different ones: the
+       inbox takes the first element whose text says "Download File", which is
+       the anchor, and the Storage reader asks for a button by role. The repaint
+       is deferred on the anchor so the browser gets to start the download the
+       click is there for first — the point is a file that WAS served. See
+       state.slowDownload. -->
+  <a id="dl" download="letter.pdf" href="data:application/pdf;base64,JVBERi0xLjQgbW9jaw=="
+     onclick="if (SLOW_DOWNLOAD) setTimeout(function(){location.href='/slow-download'},0)">Download File</a>
+  <button onclick="document.getElementById('dl').click(); if (SLOW_DOWNLOAD) location.href='/slow-download'">Download File</button>
 </div>
 </body></html>`;
 
@@ -254,6 +271,12 @@ ${sheet()}
     }
     // The card click's own repaint, answered late — see DETAIL_POSTBACK_DELAY.
     if (u.pathname === '/slow-detail') {
+      return setTimeout(() => { res.writeHead(204); res.end(); }, DETAIL_POSTBACK_DELAY);
+    }
+    // And the download button's repaint, on the same clock: the automation
+    // allows that click the same ten seconds it allows the card. The file has
+    // already been served when this is asked for — see state.slowDownload.
+    if (u.pathname === '/slow-download') {
       return setTimeout(() => { res.writeHead(204); res.end(); }, DETAIL_POSTBACK_DELAY);
     }
     if (u.pathname === '/committed') {

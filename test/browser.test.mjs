@@ -131,6 +131,30 @@ describe('portal automation', () => {
     assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'a real PDF, not an error page');
   });
 
+  test('a letter the browser has already downloaded is not lost with the click', SLOW, async () => {
+    // The download is captured in a Promise.all beside the click that starts
+    // it, and Promise.all rejects the moment either side does. Playwright waits
+    // for the page to settle after a click and gives up at its own timeout —
+    // 7ae4706's "a click that landed still throws" — so a Download File that
+    // also sends the portal back for a repaint delivers the file and throws
+    // anyway. Nothing here could produce it: the fixture's `<a download>` is a
+    // data: URL and starts no navigation, so the two paths that still let the
+    // click answer for the download were never shown the failure every sibling
+    // had already been taught. Chromium had letter.pdf in hand and the caller
+    // got `ERROR: locator.click: Timeout 10000ms exceeded` with an empty output
+    // directory.
+    const dir = mkdtempSync(join(tmpdir(), 'epost-slowdl-'));
+    portal.state.slowDownload = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_download_letter', { index: 0, output_dir: dir });
+      assert.ok(!isError, `a file the browser had already served came back as a failure: ${raw.slice(0, 200)}`);
+      assert.ok(data.saved, `nothing was saved: ${raw.slice(0, 200)}`);
+      assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'a real PDF, not an error page');
+    } finally {
+      portal.state.slowDownload = false;
+    }
+  });
+
   test('lists the Storage folders with their counts, and keeps the company one out', SLOW, async () => {
     // "these are present" passed while the ePost Scancenter tile — a branded
     // folder the service maintains, and not a filing target — was offered as a
@@ -389,6 +413,30 @@ describe('portal automation', () => {
     assert.match(basename(data.saved), /_0\.pdf$/,
       `the resolved position is missing from the name: ${basename(data.saved)}`);
     assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'a real PDF, not an error page');
+  });
+
+  test('a reading and its file survive a download click that outlasts itself', SLOW, async () => {
+    // The same Promise.all one panel over, where it costs more than the file.
+    // By the time the download control is pressed the whole reading has been
+    // taken out of a viewer the portal did open — subject, type, date, amount,
+    // folder — and a throw from the click discards all of it and leaves before
+    // the Escape that puts the viewer away. So a document that had been read in
+    // full came back as `ERROR: locator.click: Timeout 10000ms exceeded`, which
+    // is exactly the trade this function's own `partial` status exists to
+    // avoid: the reading half can succeed while the saving half does not.
+    const dir = mkdtempSync(join(tmpdir(), 'epost-slowdl-doc-'));
+    portal.state.slowDownload = true;
+    try {
+      const { data, raw, isError } = await srv.call('epost_read_storage_document', { index: 0, output_dir: dir });
+      assert.ok(!isError, `a document that was read in full came back as a failure: ${raw.slice(0, 200)}`);
+      assert.equal(data.status, 'ok', `it was not reported as read at all: ${raw.slice(0, 200)}`);
+      assert.equal(data.subject, 'Invoice from Caramba Example AG',
+        `the reading was lost with the click: ${raw.slice(0, 200)}`);
+      assert.ok(data.saved, `the file the browser had already served was not kept: ${raw.slice(0, 200)}`);
+      assert.ok(readFileSync(data.saved).toString().startsWith('%PDF'), 'a real PDF, not an error page');
+    } finally {
+      portal.state.slowDownload = false;
+    }
   });
 
   test('a folder the portal refuses is reported as refused, not as created', SLOW, async () => {
