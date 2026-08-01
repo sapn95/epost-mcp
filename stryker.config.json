@@ -25,5 +25,6 @@
     "high": 90,
     "low": 70,
     "break": null
-  }
+  },
+  "_timeout": "Watch the timeout count, not the score, when changing this or concurrency. Stryker counts a timeout as a kill, so an allowance too tight for the machine records merely slow mutants as caught and the score inflates. On the pingen sibling, tightening it while raising concurrency took the score from 76.92% to 89.66% and the timeout count from 172 to 531 \u2014 nothing had improved."
 }
