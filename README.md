@@ -33,6 +33,46 @@ preferred path: no browser, no session, and letters arrive with a real sender
 description. Browser automation via Playwright remains for the few things the
 API does not cover.
 
+## How a call gets answered
+
+Two ways in, and the server picks per call rather than per session — so the
+same conversation can read a letter over the API and archive it in the browser
+without you arranging anything. `EPOST_TRANSPORT` pins that choice if you would
+rather it did not move.
+
+```mermaid
+flowchart TD
+    C["MCP client<br/>(Claude Code, Claude Desktop, …)"] -->|"stdio JSON-RPC"| S["epost-mcp"]
+
+    S --> T{"EPOST_TRANSPORT"}
+    T -->|"api — pinned"| A
+    T -->|"browser — pinned"| B
+    T -->|"auto (default)"| D{"Does this call<br/>reach for a page?"}
+    D -->|"no"| A["REST call to api.epost.ch"]
+    D -->|"yes — and only then<br/>is a browser launched"| B["Playwright drives<br/>app.epost.ch"]
+
+    K["Keycloak token<br/>password grant or API key,<br/>from the macOS keychain"] -.->|"bearer"| A
+    A --> E[("ePost<br/>Digital Letterbox")]
+    B --> E
+
+    subgraph disk["on disk — a live letterbox session, and secret"]
+        P["Chromium profile<br/>~/.epost-mcp/profile"]
+        ST["storageState<br/>~/.epost-mcp/state.json"]
+    end
+    disk -.->|"seeds the context"| B
+    B -.->|"state.json re-saved after<br/>every successful call"| ST
+    L["epost_login<br/>visible window, one Touch ID"] -.->|"fills state.json once"| ST
+
+    classDef pin fill:#fff4e5,stroke:#d9822b
+    classDef store fill:#fdecea,stroke:#c0392b
+    class T,D pin
+    class P,ST store
+    style disk fill:#fbfbfb,stroke:#999,stroke-dasharray: 4 3
+```
+
+A pin is enforced both ways. Pinned to `api`, a browser-only tool is refused
+rather than quietly redirected — the point of pinning is knowing what ran.
+
 ## Prerequisites
 
 - **Node.js ≥ 20.19**
