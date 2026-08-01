@@ -279,6 +279,26 @@ async function saveState() {
 
 const DEBUG = !!process.env.EPOST_DEBUG;   // trace the login steps on stderr
 
+// The portal repaints in its own time and fires nothing to say when it is done,
+// so the automation below pauses at the points where the DOM is known to change
+// under it. Twenty-two of those pauses come to half a minute of standing still
+// per pass — which the portal earns, and the DOM fixture in test/ does not: it
+// answers instantly and then gets waited out anyway. That is nearly the whole
+// cost of a test run, and a run too expensive to repeat is one that stops being
+// repeated. So the pauses have a scale, and only the pauses: nothing here is
+// read anywhere near a timeout, so a suite running at a tenth still proves what
+// a real run does about how long the automation waits before giving up. It only
+// ever shortens — a value above 1, or one that is not a number, is not a way to
+// make the portal slower, it is a typo, and the answer to a typo is the default.
+const WAIT_SCALE = (() => {
+  const n = Number(process.env.EPOST_WAIT_SCALE);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : 1;
+})();
+// The floor is not politeness: a pause of zero is a yield that lets the very
+// next line run in the same frame the click did, which is the one thing none of
+// these pauses may become.
+const pause = (p, ms) => p.waitForTimeout(Math.max(25, Math.round(ms * WAIT_SCALE)));
+
 function keychainRead(service, account = 'epost') {
   try {
     return execFileSync('security', ['find-generic-password', '-a', account, '-s', service, '-w'],
@@ -719,7 +739,7 @@ async function ensureLetterbox(p, timeout = 40000) {
   // Let the SwissID/KLARA SSO redirect chain settle onto the dashboard (or a
   // visible login form if the cached session has expired).
   for (let i = 0; i < 20; i++) {
-    await p.waitForTimeout(1500);
+    await pause(p, 1500);
     if (await isLoginPage(p)) return 'login_required';
     const u = p.url();
     if (/app\.epost\.ch/.test(u) && !/oauth_login|openid-connect/.test(u)) break;
@@ -733,7 +753,7 @@ async function ensureLetterbox(p, timeout = 40000) {
     if (p.url().includes('DigitalLetterboxOverview')) return 'ok';
     if (await p.locator('div.letter-wrapper').count()) return 'ok';
     if (await isLoginPage(p)) return 'login_required';
-    await p.waitForTimeout(1500);
+    await pause(p, 1500);
   }
   return p.url().includes('DigitalLetterboxOverview') ? 'ok' : 'login_required';
 }
@@ -773,7 +793,7 @@ async function downloadLetter(p, index, outputDir, meta) {
   const n = await wrappers.count();
   checkIndex(index, n, 'letters');
   await wrappers.nth(index).click();
-  await p.waitForTimeout(3500);
+  await pause(p, 3500);
 
   const byAria = p.locator('[aria-label="Download File"]').first();
   const byText = p.getByText('Download File', { exact: false }).first();
@@ -810,7 +830,7 @@ async function downloadLetter(p, index, outputDir, meta) {
   try { chmodSync(saved, 0o600); } catch { /* the download may live elsewhere */ }
 
   await p.keyboard.press('Escape').catch(() => {});
-  await p.waitForTimeout(1500);
+  await pause(p, 1500);
   return saved;
 }
 
@@ -825,7 +845,7 @@ async function goToStorage(p) {
     if (await gs.count()) await gs.click({ timeout: 10000 }).catch(() => {});
     for (let i = 0; i < 12; i++) {
       if (p.url().includes('LetterStorage')) break;
-      await p.waitForTimeout(1500);
+      await pause(p, 1500);
     }
   }
   // The loop above gives up quietly after eighteen seconds, and every caller
@@ -842,7 +862,7 @@ async function goToStorage(p) {
 async function listStorage(p) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
-  await p.waitForTimeout(2500);
+  await pause(p, 2500);
   const data = await p.evaluate(() => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
     const seen = new Set();
@@ -899,7 +919,7 @@ async function loadAllCards(p) {
   for (let i = 0; i < 40 && stable < 3; i++) {
     const before = await cards.count();
     await p.mouse.wheel(0, 6000);
-    await p.waitForTimeout(1000);
+    await pause(p, 1000);
     stable = (await cards.count()) === before ? stable + 1 : 0;
   }
   return cards.count();
@@ -908,7 +928,7 @@ async function loadAllCards(p) {
 async function listStorageDocuments(p, { scrollAll = false } = {}) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
-  await p.waitForTimeout(2000);
+  await pause(p, 2000);
   if (scrollAll) await loadAllCards(p);
   const docs = await p.$$eval('div.letter-wrapper', els => els.map((el, i) => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -925,7 +945,7 @@ async function createFolder(p, name) {
   const cf = p.getByText('Create a folder', { exact: false }).first();
   if (!(await cf.count())) throw new Error('"Create a folder" button not found');
   await cf.click({ timeout: 10000 });
-  await p.waitForTimeout(1500);
+  await pause(p, 1500);
   // The add-folder dialog owns its fields by id: name input ends ":folder-name",
   // the confirm button ends ":create-btn". A generic button lookup instead hits
   // the background "Create a folder" button behind the modal mask, so target the
@@ -933,7 +953,7 @@ async function createFolder(p, name) {
   const input = p.locator('[id$=":folder-name"]').first();
   await input.waitFor({ state: 'visible', timeout: 8000 });
   await input.fill(name, { timeout: 8000 });
-  await p.waitForTimeout(400);
+  await pause(p, 400);
   const createBtn = p.locator('[id$=":create-btn"]').first();
   // The click's own outcome says nothing about the folder, and it was allowed to
   // answer for it. Playwright waits for the page to settle after a click and
@@ -984,7 +1004,7 @@ async function createFolder(p, name) {
 async function moveToFolder(p, { index, title, folder, add = true, remove = null }) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
-  await p.waitForTimeout(2000);
+  await pause(p, 2000);
   // Indices come from listStorageDocuments(scroll_all), which sees every card;
   // a freshly opened Storage view only holds the first lazy-loaded batch, so
   // load the rest before resolving one by position.
@@ -1007,11 +1027,11 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   const menuBtn = card.locator('.letter-action-menu').first();
   if (!(await menuBtn.count())) throw new Error('action menu ("...") not found on the document');
   await menuBtn.click({ timeout: 8000 });
-  await p.waitForTimeout(1000);
+  await pause(p, 1000);
 
   // Click the visible "Move" item (there is one hidden tooltip menu per card).
   if (!(await clickVisibleByText(p, 'Move'))) throw new Error('"Move" menu item did not become visible');
-  await p.waitForTimeout(1800);
+  await pause(p, 1800);
 
   // "Select a folder" bottom sheet. Each folder option is a `.brand-container`
   // holding the name and a PrimeFaces checkbox. The checkbox sits low in a
@@ -1071,7 +1091,7 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
     if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
     throw new Error(`remove_from "${remove}" is not offered in the move sheet — nothing was changed`);
   }
-  await p.waitForTimeout(600);
+  await pause(p, 600);
 
   if (!picked.changed) {
     const cancel = p.locator('[id$=":cancel"]').first();
@@ -1093,7 +1113,7 @@ async function moveToFolder(p, { index, title, folder, add = true, remove = null
   // unguarded in front of it meant the flow could not reach the very evidence it
   // had just been given.
   await confirmBtn.click({ timeout: 8000, force: true }).catch(() => {});
-  await p.waitForTimeout(1500);
+  await pause(p, 1500);
 
   // Some moves raise a confirmation popup — accept it best-effort if present.
   const popup = p.locator('[id*="folderMovingConfirmationPopup"]');
@@ -1218,7 +1238,7 @@ async function assistedLogin(p, waitMs = 300000) {
   };
 
   while (Date.now() < deadline) {
-    await p.waitForTimeout(1500);
+    await pause(p, 1500);
     const u = p.url();
     // Origin and path only. A SwissID/OIDC step carries the authorisation code,
     // the state and the session id in its query string, and truncating at 90
@@ -1293,7 +1313,7 @@ async function storeLetter(p, { index, title, folder }) {
   // Start every store from a freshly rendered overview instead.
   await p.keyboard.press('Escape').catch(() => {});
   await p.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-  await p.waitForTimeout(2500);
+  await pause(p, 2500);
   const cards = p.locator('div.letter-wrapper');
   await cards.first().waitFor({ state: 'visible', timeout: 20000 }).catch(() => {});
   let card;
@@ -1309,9 +1329,9 @@ async function storeLetter(p, { index, title, folder }) {
   const menu = card.locator('.letter-action-menu').first();
   if (!(await menu.count())) throw new Error('action menu ("...") not found on the letter');
   await menu.click({ timeout: 8000 });
-  await p.waitForTimeout(1000);
+  await pause(p, 1000);
   if (!(await clickVisibleByText(p, 'Store'))) throw new Error('"Store" menu item did not become visible');
-  await p.waitForTimeout(2200);
+  await pause(p, 2200);
 
   // Store is TWO steps. The menu item only opens a "Select a folder" sheet with
   // one checkbox per folder and its own Store button, greyed out until a folder
@@ -1372,7 +1392,7 @@ async function storeLetter(p, { index, title, folder }) {
     if (await cancel.count()) await cancel.click({ timeout: 5000, force: true }).catch(() => {});
     throw new Error(`folder "${folder}" not in the store sheet. Offered: ${picked.offered.join(' | ')}`);
   }
-  await p.waitForTimeout(700);
+  await pause(p, 700);
 
   // Confirm with the sheet's own Store button. aria-disabled lags behind the
   // real state once a folder is ticked, so force the click.
@@ -1428,7 +1448,7 @@ async function storeLetter(p, { index, title, folder }) {
 async function readStorageDocument(p, { index, title, outputDir }) {
   const st = await goToStorage(p);
   if (st !== 'ok') return { status: st };
-  await p.waitForTimeout(1500);
+  await pause(p, 1500);
   await loadAllCards(p);
 
   const cards = p.locator('div.letter-wrapper');
@@ -1598,7 +1618,7 @@ async function readStorageDocument(p, { index, title, outputDir }) {
     }
   }
   await p.keyboard.press('Escape').catch(() => {});
-  await p.waitForTimeout(1200);
+  await pause(p, 1200);
   // A caller that asked for the file and got `saved: null` beside `status: ok`
   // was told the whole request succeeded. It did not: the reading half did.
   if (outputDir && !saved) {
