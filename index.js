@@ -783,10 +783,26 @@ async function downloadLetter(p, index, outputDir, meta) {
     throw new Error('"Download File" button not found in the letter detail');
   }
 
-  const [dl] = await Promise.all([
-    p.waitForEvent('download', { timeout: 20000 }),
-    target.click({ timeout: 10000 }),
-  ]);
+  // Promise.all rejects the moment EITHER side does, and the click is the side
+  // that fails for reasons which have nothing to do with the file. Playwright
+  // waits for the page to settle after a click and gives up at its own timeout
+  // — the whole of what 7ae4706 called "a click that landed still throws", and
+  // a Download File that also sends the portal back for a repaint is precisely
+  // that shape, the one POSTBACK_DELAY has reproduced for the two confirm
+  // buttons since the round that found it. Nothing here ever produced it,
+  // because the fixture's `<a download>` starts no navigation, so the two
+  // places that still let a click answer for a download went unexamined while
+  // every sibling was taught otherwise one by one. Proven now: Chromium
+  // delivered letter.pdf, the download event fired, and the caller got `ERROR:
+  // locator.click: Timeout 10000ms exceeded` with an empty output directory —
+  // the one thing the call exists for, thrown away by the failure of the step
+  // that had already succeeded. The listener still goes up BEFORE the click,
+  // which is the only ordering that can catch the event; what changes is that
+  // the click no longer gets to answer for the file. A download that never
+  // comes is still an error, and it is the wait that says so.
+  const started = p.waitForEvent('download', { timeout: 20000 });
+  await target.click({ timeout: 10000 }).catch(() => {});
+  const dl = await started;
   const date = meta?.dates?.[0];
   const stamp = date ? date.split('.').reverse().join('-') : 'undated';
   const saved = join(outputDir, `${namePart(stamp)}_ePost_${namePart(index)}.pdf`);
@@ -1559,10 +1575,19 @@ async function readStorageDocument(p, { index, title, outputDir }) {
     const btn = p.getByRole('button', { name: 'Download File' }).first();
     const target = (await btn.count()) ? btn : p.locator('a.st-harddrive-download').first();
     if (await target.count()) {
-      const [d] = await Promise.all([
-        p.waitForEvent('download', { timeout: 25000 }),
-        target.click({ timeout: 10000 }),
-      ]);
+      // The same arrangement as in downloadLetter and undone for the same
+      // reason: a click that landed still throws when the portal is slow to
+      // settle afterwards, and inside a Promise.all its rejection takes the
+      // download with it. Here it takes more than the file. Everything above
+      // has already been read — the subject, the type, the amount, the folder,
+      // all of it out of a viewer the portal did open — and a throw from this
+      // line discards the lot and leaves before the Escape below, so the reply
+      // is a click timeout about a document that was read in full. That is the
+      // exact trade this function's own `partial` status exists to avoid: the
+      // reading half can succeed while the saving half does not.
+      const started = p.waitForEvent('download', { timeout: 25000 });
+      await target.click({ timeout: 10000 }).catch(() => {});
+      const d = await started;
       const stamp = (meta.documentDate || '').split('.').reverse().join('-') || 'undated';
       // `x` for every title-addressed download meant two documents with the
       // same date quietly overwrote each other. The resolved position is what
