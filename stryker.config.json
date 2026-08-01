@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation testing answers the question the review rounds kept asking by hand: if this guard were removed, would anything notice? On the sibling server pingen-mcp a full pass found eleven defects that eleven model rounds had not.",
+  "_scope": "Do not run this over the whole file. One pass is roughly 305 seconds, so 800-odd mutants at concurrency three is most of a day. Use scripts/mutate-changed.mjs, which mutates only what a round touched \u2014 that is the question a review round is asking anyway. A full pass is affordable on pingen-mcp and is not affordable here.",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "node --test --test-concurrency=1 test/api.test.mjs test/browser.test.mjs"
+  },
+  "_runner": "The command runner, not tap: the tests drive the server as a separate stdio child, so an in-process mutant switch never reaches the code under test and every mutant comes back NoCoverage. Hygiene is left out \u2014 it reads tracked files, so a mutant in index.js cannot change its result, and it is pure cost on every one of them.",
+  "mutate": [
+    "index.js"
+  ],
+  "coverageAnalysis": "off",
+  "incremental": false,
+  "_incremental": "Off, and it has to be. Reuse is decided per mutant from which tests killed it, and the command runner reports the whole suite as ONE synthetic test whose identity never changes \u2014 so any test edit is invisible and the run replays old numbers in seconds.",
+  "timeoutMS": 30000,
+  "concurrency": 3,
+  "_concurrency": "Three, not twelve. This suite drives real Chromium, and several of them launched against one another is precisely the arrangement that produces failures which vanish when a file is run alone \u2014 and a spurious failure here is not a flake, it is a mutant recorded as killed that nothing actually kills.",
+  "reporters": [
+    "clear-text",
+    "json"
+  ],
+  "thresholds": {
+    "high": 90,
+    "low": 70,
+    "break": null
+  }
+}
