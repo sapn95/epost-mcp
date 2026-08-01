@@ -51,7 +51,9 @@ flowchart TD
     D -->|"no"| A["REST call to api.epost.ch"]
     D -->|"yes — and only then<br/>is a browser launched"| B["Playwright drives<br/>app.epost.ch"]
 
-    K["Keycloak token<br/>password grant or API key,<br/>from the macOS keychain"] -.->|"bearer"| A
+    K1["account password<br/>keychain: epost-mcp-api-password"] -->|"password grant"| KC["Keycloak token"]
+    KC -.->|"Authorization: Bearer"| A
+    K2["API key<br/>keychain: epost-mcp-api-key"] -.->|"X-API-KEY"| A
     A --> E[("ePost<br/>Digital Letterbox")]
     B --> E
 
@@ -360,7 +362,7 @@ never removes an existing membership. Two consequences worth knowing:
 | `EPOST_API_BASE` | `https://api.epost.ch` | API host — overridable for tests |
 | `EPOST_APP_URL` | `https://app.epost.ch` | Portal base — overridable for tests |
 | `EPOST_DEBUG` | unset | `1` traces the login steps on stderr |
-| `EPOST_WAIT_SCALE` | `1` | Scales the fixed pauses that let the portal repaint, and nothing else — no timeout is derived from it. Only shortens: a value outside `(0, 1]` is read as a typo and ignored. Meant for the test suite, which drives a local DOM fixture that has nothing to repaint |
+| `EPOST_WAIT_SCALE` | `1` | Scales the fixed pauses that let the portal repaint, and nothing else — no timeout is derived from it. Only shortens: anything that is not a finite number in `(0, 1]` is read as a typo and ignored, and no scaled pause goes below 25 ms, because a pause of nothing is a yield rather than a pause. Meant for the test suite, which drives a local DOM fixture that has nothing to repaint |
 
 The browser is resolved in that order deliberately: an installed, signed browser
 first, because only that one can reach the platform authenticator, and only then
