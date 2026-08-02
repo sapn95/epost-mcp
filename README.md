@@ -449,6 +449,7 @@ there is no credential, by design.
 
     npm run gate      # lint + smoke + hygiene + tests with coverage enforced
     npm test          # just the tests
+    npm run mutate    # mutation-test the lines this branch changed
 
 Runs exactly what CI runs, offline and without credentials: a syntax check, the
 protocol smoke test and the hygiene scan.
@@ -459,6 +460,17 @@ in the dispatcher but missing from the tool list (or advertised and unhandled), 
 required property absent from a schema, and descriptions too thin to choose a
 tool from. The hygiene scan refuses secrets, tracked session files and personal
 identifiers.
+
+`npm run mutate` asks a different question from the rest: not "do the tests
+pass" but "would they notice if a guard were removed". StrykerJS deletes one
+piece of behaviour at a time and reruns the suite; anything that survives is
+something no assertion is watching. It found eleven real gaps in the sibling
+`pingen-mcp` after model review rounds had stopped turning anything up.
+
+Only the lines a branch changed, because a whole-file pass here means driving a
+real browser once per mutant and costs most of a day. `npm run mutate:all` does
+the whole file if you have the time; `stryker.config.json` explains every
+setting that is not a default, including why incremental mode is off.
 
 ## License
 
