@@ -1752,6 +1752,14 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         swissid_user: user
           ? (/^.+@.+$/.test(user) ? user.replace(/^(.).*(@.*)$/, '$1***$2') : `${user[0]}*** (${user.length} chars, not an e-mail)`)
           : 'not set — epost_login cannot skip the e-mail step',
+        // The scale actually in force, not the string that was set. It only ever
+        // shortens and silently ignores anything outside (0, 1], so a typo — 2
+        // instead of 0.2, a stray minus, a word — leaves the automation running
+        // at full speed with nothing to say so. Reported here because a
+        // configuration report is where someone looks when the timing is not
+        // what they asked for, and because a rule nothing can observe is a rule
+        // nothing can test.
+        wait_scale: WAIT_SCALE,
         paths: { state: STATE, profile: PROFILE },
         settings: {
           EPOST_TRANSPORT: 'auto | api | browser',

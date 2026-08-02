@@ -57,6 +57,12 @@ describe('authentication', () => {
     const { data } = await srv.call('epost_settings');
     assert.match(data.api, /password grant/);
     assert.equal(data.transport, 'api');
+    // The scale in force, not the string that was set. It only ever shortens
+    // and ignores anything outside (0, 1] without a word, so a 2 where 0.2 was
+    // meant leaves the automation running at full speed with nothing to say so
+    // — and until this was reported, nothing outside the process could see
+    // which value the rule had settled on.
+    assert.equal(data.wait_scale, 1, 'the default is full speed');
   });
 });
 
