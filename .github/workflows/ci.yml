@@ -74,8 +74,12 @@ jobs:
       - name: hygiene, being secrets, personal data and tracked state files
         run: npm run hygiene
 
+      # xvfb, because epost_login opens a VISIBLE window — that is the point of
+      # it, and the suite drives the real thing rather than mocking it away. On
+      # a runner with no display the headed launch dies in about 150 ms and the
+      # test reads as a login that returned early.
       - name: tests, with a coverage floor under them
-        run: npm run coverage
+        run: xvfb-run -a npm run coverage
 
       - name: audit
         # A finding here is nearly always transitive and unreachable from this

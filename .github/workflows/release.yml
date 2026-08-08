@@ -90,8 +90,10 @@ jobs:
       # The same gate CI runs, run once more against the tagged commit. A
       # publish cannot be taken back, so this is the one place where repeating
       # a check that already passed on main is worth the two minutes.
-      - name: the gate, being lint, smoke, hygiene and tests with a floor
-        run: npm run gate
+      # Under xvfb for the same reason CI is: epost_login opens a visible
+      # window, and a runner has no display to open it on.
+      - name: the gate
+        run: xvfb-run -a npm run gate
 
       - name: publish
         run: npm publish
