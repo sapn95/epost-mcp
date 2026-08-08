@@ -1,37 +1,115 @@
-name: CI
+# The checks are the ones `npm run gate` runs locally, listed here one step at
+# a time rather than behind that single command. Each is still defined once, in
+# package.json; what is spelled out is only the order. The reason is the checks
+# list on a pull request: "lint" going red says what happened, where a red
+# "gate" is a log to go and read.
+#
+# Until this was written, CI here ran neither the linter nor the tests, both of
+# which existed the whole time.
+#
+# The frame around it — triggers, permissions, concurrency, timeouts, and the
+# workflow and secret jobs — is the shared one:
+# https://github.com/sapn95/.github/blob/main/CI.md
+name: ci
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
+    name: check
     runs-on: ubuntu-latest
+    # The browser half of the suite dominates this — around four and a half
+    # minutes locally, plus the chromium download.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor package.json claims to support, and the current release.
+        # Both, because "engines: >=20.19" is a claim like any other.
+        node: ["20", "24"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
         with:
-          node-version: '20'
+          # Nothing here pushes, and `pull_request` runs code from strangers.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
           cache: npm
 
-      - name: Install
+      - name: install
+        # --ignore-scripts, so a postinstall in a dependency cannot run on a
+        # runner that has just checked out somebody else's branch. Playwright's
+        # browser download is done explicitly below instead.
         run: npm ci --ignore-scripts
 
-      - name: Syntax
+      - name: syntax
         run: node --check index.js
 
-      # Protocol handshake + tool-schema validation. Offline: no network, no
-      # credentials, no browser download, so it is safe on a public runner.
-      - name: Smoke test
-        run: node scripts/smoke.mjs
-        env:
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      - name: lint
+        run: npm run lint
 
-      - name: Hygiene (secrets, personal data, tracked state files)
-        run: node scripts/hygiene.mjs
+      - name: chromium, for the browser half of the suite
+        # Without it the browser tests fail on newPage rather than skip, which
+        # is how they came to be left out of CI in the first place.
+        run: npx playwright install --with-deps chromium
 
-      - name: Audit
-        run: npm audit --audit-level=high
+      # Protocol handshake and tool-schema validation. Offline: no network, no
+      # credentials, so it is safe on a public runner.
+      - name: smoke test
+        run: npm run smoke
+
+      - name: hygiene, being secrets, personal data and tracked state files
+        run: npm run hygiene
+
+      - name: tests, with a coverage floor under them
+        run: npm run coverage
+
+      - name: audit
+        # A finding here is nearly always transitive and unreachable from this
+        # code, and blocking a pull request on somebody else's advisory helps
+        # nobody. Dependabot files the ones that need doing.
         continue-on-error: true
+        run: npm audit --audit-level=high
+
+  workflows:
+    name: lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: actionlint
+        uses: raven-actions/actionlint@v2.2.0
+      - name: yamllint
+        run: pipx run yamllint .
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v24
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # gitleaks reads the history, not just the tip.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
