@@ -221,7 +221,14 @@ describe('portal automation', () => {
     try {
       const started = Date.now();
       const { data } = await srv.call('epost_login', { wait_seconds: 30 });
-      assert.ok(Date.now() - started >= 29000, 'it returned before the window it was given');
+      const elapsed = Date.now() - started;
+      // The elapsed time and the reply both go in the message: "it returned
+      // early" on its own says nothing about whether the wait was cut short or
+      // the flow never got as far as waiting.
+      assert.ok(
+        elapsed >= 29000,
+        `it returned after ${elapsed} ms of a 30000 ms window, with ${JSON.stringify(data)}`,
+      );
       assert.equal(data.status, 'login_required',
         'no authenticated session exists, so login must not claim one');
       assert.ok(data.hint || data.browser, 'it says what the caller should do next');

@@ -173,7 +173,7 @@ The API documents an **API key** and **Bearer** auth, and this server does both.
 
 **Password grant** (what the private-tenant guide describes):
 
-```
+```text
 POST /core/latest/tenants   {username, password}                     -> tenant_id, company_id
 POST /core/latest/token     {username, password, grant_type=password,
                              tenant_id, company_id}                  -> access_token (600s)
@@ -209,7 +209,7 @@ force the browser for the one thing only it can do.
 `epost_login` drives every step of the SwissID chain that does not need a human
 and stops at the only one that does — the biometric prompt:
 
-```
+```text
 app.epost.ch → login.epost.ch     clicks "Login mit SwissID"
              → login-email         fills your account e-mail, "Weiter"
              → confirm-passkey     "Weiter"   → macOS asks for Touch ID   ← you
@@ -428,7 +428,9 @@ workflow in the repo from publishing under your name.
 
 Then every release is one command:
 
-    npm version patch && git push --follow-tags
+```bash
+npm version patch && git push --follow-tags
+```
 
 The tag triggers the release workflow: it upgrades npm (trusted publishing needs
 >= 11.5.1 and Node >= 22.14), refuses a tag whose version disagrees with
@@ -436,8 +438,10 @@ package.json, runs the gate, and publishes with a signed provenance statement.
 
 ### If the publish fails with 404
 
-    npm notice publish Signed provenance statement ... from GitHub Actions
-    npm error 404 Not Found - PUT https://registry.npmjs.org/epost-mcp
+```text
+npm notice publish Signed provenance statement ... from GitHub Actions
+npm error 404 Not Found - PUT https://registry.npmjs.org/epost-mcp
+```
 
 Provenance was signed, so OIDC worked — the registry simply does not accept this
 workflow as a publisher yet. That means the **trusted publisher is not configured**,
@@ -447,9 +451,11 @@ there is no credential, by design.
 
 ## Checks
 
-    npm run gate      # lint + smoke + hygiene + tests with coverage enforced
-    npm test          # just the tests
-    npm run mutate    # mutation-test the lines this branch changed
+```bash
+npm run gate      # lint + smoke + hygiene + tests with coverage enforced
+npm test          # just the tests
+npm run mutate    # mutation-test the lines this branch changed
+```
 
 Runs exactly what CI runs, offline and without credentials: a syntax check, the
 protocol smoke test and the hygiene scan.
