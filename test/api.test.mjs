@@ -1230,6 +1230,27 @@ describe('letter PDF', () => {
     }
   });
 
+  test('a Storage listing wrapped in an object is read, and one that failed is not taken for "no such letter"', async () => {
+    tm.state.contentPdf = true;
+    try {
+      for (const wrap of ['letters', 'content']) {
+        tm.state.archiveWrappedIn = wrap;
+        assert.equal((await ts.call('epost_letter_pdf', { letter_id: 'arch-1' })).data.location, 'storage', wrap);
+      }
+    } finally {
+      tm.state.archiveWrappedIn = null;
+      tm.state.contentPdf = false;
+    }
+    tm.state.archiveFails = true;
+    try {
+      const { data } = await ts.call('epost_letter_pdf', { letter_id: 'arch-1' });
+      assert.match(data.error, /needs the public API and it is unavailable/);
+      assert.equal((await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.location, 'inbox', 'the inbox still answers');
+    } finally {
+      tm.state.archiveFails = false;
+    }
+  });
+
   test('refuses what is not a letter, not a PDF, or too big to hand back', async () => {
     assert.match((await ts.call('epost_letter_pdf', {})).data.error, /letter_id is required/);
     assert.match((await ts.call('epost_letter_pdf', { letter_id: 'nope' })).data.error, /no letter nope in the inbox or in Storage/);
