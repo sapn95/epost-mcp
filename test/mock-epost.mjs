@@ -182,6 +182,9 @@ export function start() {
       const cap = xs => (n > 0 ? xs.slice(0, n) : xs);
       if (d && d === state.failDirectoryId) return send(503, { error: 'directory_unavailable' });
       if (d) return send(200, cap(state.archive.filter(l => (state.inFolder[d] || []).includes(l.id))));
+      if (state.archiveFails) return send(503, { error: 'archive_unavailable' });
+      // Some answers wrap the list in an object; the readers unwrap it.
+      if (state.archiveWrappedIn) return send(200, { [state.archiveWrappedIn]: cap(state.archive) });
       return send(200, cap(state.archive));      // note: no folder field, like the real one
     }
     const m = /^\/epost\/v2\/letters\/([^/]+)(\/.*)?$/.exec(p);

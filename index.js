@@ -725,11 +725,15 @@ async function letterForReading(id) {
   if (!inbox) return null;
   const here = inbox.find(x => x.id === id);
   if (here) return { letter: here, location: 'inbox' };
+  // Storage could not be asked: that is not the same as the letter not being
+  // there, so it is answered as the API being unavailable.
   const archive = await apiListArchive(undefined, 1000);
-  const filed = Array.isArray(archive) ? archive.find(x => x.id === id) : null;
+  if (!archive) return null;
+  const items = Array.isArray(archive) ? archive : (archive.letters || archive.content || []);
+  const filed = items.find(x => x.id === id);
   if (filed) return { letter: filed, location: 'storage' };
   // Either list may have come back full and still not be everything.
-  if (inbox.length >= INBOX_WINDOW || (Array.isArray(archive) && archive.length >= 1000)) {
+  if (inbox.length >= INBOX_WINDOW || items.length >= 1000) {
     const direct = await apiGetLetter(id);
     if (direct) return { letter: direct, location: 'unknown' };
   }
