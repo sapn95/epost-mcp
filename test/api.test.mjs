@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
+import { createHash } from 'node:crypto';
 import { start, TOKEN, API_KEY } from './mock-epost.mjs';
 import { startServer } from './client.mjs';
 
@@ -952,6 +953,13 @@ describe('an inbox longer than one listing', () => {
     assert.ok(!m.state.inbox.some(l => l.id === id), 'it did not leave the inbox');
   });
 
+  test('and its PDF can be read by id past the window, as can one that is nowhere be refused', async () => {
+    const { data, raw } = await s.call('epost_letter_pdf', { letter_id: 'bulk-297' });
+    assert.equal(data.location, 'unknown', raw.slice(0, 200));
+    assert.match(Buffer.from(data.pdf_base64, 'base64').toString(), /bulk-297/);
+    assert.match((await s.call('epost_letter_pdf', { letter_id: 'no-such-letter' })).data.error, /no letter no-such-letter in the inbox or in Storage/);
+  });
+
   test('and can still be downloaded by id', async () => {
     const id = 'bulk-298';
     const { data, raw } = await s.call('epost_download_letter', { letter_id: id, output_dir: dir });
@@ -1161,6 +1169,7 @@ describe('letter text', () => {
     const { data, raw } = await ts.call('epost_letter_text', { letter_id: 'inbox-2' });
     assert.equal(data.transport, 'api', raw.slice(0, 200));
     assert.equal(data.id, 'inbox-2');
+    assert.equal(data.location, 'inbox');
     assert.match(data.text, /Brief inbox-2/, 'the text of the letter that was asked for');
     assert.match(data.text, /Frist: 31\. Oktober 2026/);
     assert.match(data.text, /Grüessech/, 'decoded as UTF-8');
@@ -1168,10 +1177,16 @@ describe('letter text', () => {
     assert.equal(data.chars, data.text.length);
   });
 
+  test('a letter already filed in Storage reads the same way', async () => {
+    const { data } = await ts.call('epost_letter_text', { letter_id: 'arch-1' });
+    assert.equal(data.location, 'storage');
+    assert.match(data.text, /Brief arch-1/);
+  });
+
   test('says why when there is nothing to read', async () => {
     assert.match((await ts.call('epost_letter_text', {})).data.error, /letter_id is required/);
     assert.match((await ts.call('epost_letter_text', { letter_id: '  ' })).data.error, /letter_id is required/);
-    assert.match((await ts.call('epost_letter_text', { letter_id: 'nope' })).data.error, /no letter nope in the inbox/);
+    assert.match((await ts.call('epost_letter_text', { letter_id: 'nope' })).data.error, /no letter nope in the inbox or in Storage/);
     tm.state.contentAsHtml = true;
     try {
       assert.match((await ts.call('epost_letter_text', { letter_id: 'inbox-1' })).data.error, /not a PDF/);
@@ -1186,6 +1201,51 @@ describe('letter text', () => {
       assert.match((await bare.call('epost_letter_text', { letter_id: 'inbox-1' })).data.error, /is not installed here: poppler-utils/);
     } finally {
       bare.stop();
+    }
+  });
+});
+
+describe('letter PDF', () => {
+  let tm, ts;
+  before(async () => {
+    tm = await start();
+    ts = await startServer({ EPOST_API_BASE: tm.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { ts?.stop(); await tm?.close(); });
+
+  test('hands back the bytes of the letter asked for, from the inbox or from Storage', async () => {
+    tm.state.contentPdf = true;
+    try {
+      for (const [id, location] of [['inbox-2', 'inbox'], ['arch-3', 'storage']]) {
+        const { data, raw } = await ts.call('epost_letter_pdf', { letter_id: id });
+        assert.equal(data.location, location, raw.slice(0, 200));
+        const bytes = Buffer.from(data.pdf_base64, 'base64');
+        assert.equal(bytes.length, data.bytes);
+        assert.equal(bytes.subarray(0, 5).toString(), '%PDF-');
+        assert.ok(bytes.includes(Buffer.from(`Brief ${id}`)), 'the letter that was asked for');
+        assert.equal(data.sha256, createHash('sha256').update(bytes).digest('hex'));
+      }
+    } finally {
+      tm.state.contentPdf = false;
+    }
+  });
+
+  test('refuses what is not a letter, not a PDF, or too big to hand back', async () => {
+    assert.match((await ts.call('epost_letter_pdf', {})).data.error, /letter_id is required/);
+    assert.match((await ts.call('epost_letter_pdf', { letter_id: 'nope' })).data.error, /no letter nope in the inbox or in Storage/);
+    tm.state.contentAsHtml = true;
+    try {
+      assert.match((await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.error, /not a PDF/);
+    } finally {
+      tm.state.contentAsHtml = false;
+    }
+    const small = await startServer({ EPOST_API_BASE: tm.base, EPOST_TRANSPORT: 'api', EPOST_PDF_MAX_BYTES: '10' });
+    tm.state.contentPdf = true;
+    try {
+      assert.match((await small.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.error, /over the 10 this tool hands back inline/);
+    } finally {
+      tm.state.contentPdf = false;
+      small.stop();
     }
   });
 });
