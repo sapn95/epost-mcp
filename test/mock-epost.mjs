@@ -192,6 +192,7 @@ export function start() {
       const [, id, tail] = m;
       // Deleted letters are addressable too — restoring one is the whole point.
       const known = [...state.inbox, ...state.archive, ...state.deleted].find(l => l.id === id);
+      if (state.failLetterGet && !tail && req.method === 'GET') return send(503, { error: 'letter_unavailable' });
       if (!known) return send(404, { error: 'not_found' });
       // The id goes in the bytes: identical content for every letter meant a
       // download that fetched the wrong one was indistinguishable from a
