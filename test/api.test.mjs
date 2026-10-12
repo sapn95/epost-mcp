@@ -1241,6 +1241,12 @@ describe('letter PDF', () => {
       tm.state.archiveWrappedIn = null;
       tm.state.contentPdf = false;
     }
+    tm.state.archiveWrappedIn = 'items';
+    try {
+      assert.match((await ts.call('epost_letter_pdf', { letter_id: 'arch-1' })).data.error, /unavailable/, 'an unknown shape is not an empty Storage');
+    } finally {
+      tm.state.archiveWrappedIn = null;
+    }
     tm.state.archiveFails = true;
     try {
       const { data } = await ts.call('epost_letter_pdf', { letter_id: 'arch-1' });
@@ -1248,6 +1254,33 @@ describe('letter PDF', () => {
       assert.equal((await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.location, 'inbox', 'the inbox still answers');
     } finally {
       tm.state.archiveFails = false;
+    }
+  });
+
+  test('an id that could change the path is refused before any call', async () => {
+    for (const tool of ['epost_letter_pdf', 'epost_letter_text']) {
+      for (const id of ['../archives/letters', 'a/b', 'x?y=1', 'a b']) {
+        assert.match((await ts.call(tool, { letter_id: id })).data.error, /is not a letter id/, `${tool} ${id}`);
+      }
+    }
+  });
+
+  test('a letter in neither listing is asked for by id, and a failure there is not "no such letter"', async () => {
+    tm.state.failLetterGet = true;
+    try {
+      assert.match((await ts.call('epost_letter_pdf', { letter_id: 'nope' })).data.error, /needs the public API and it is unavailable/);
+    } finally {
+      tm.state.failLetterGet = false;
+    }
+    // A letter in the trash is in neither listing but is still known by id.
+    tm.state.deleted.push({ ...tm.state.archive[0], id: 'trashed-1' });
+    tm.state.contentPdf = true;
+    try {
+      const { data } = await ts.call('epost_letter_pdf', { letter_id: 'trashed-1' });
+      assert.equal(data.location, 'unknown');
+    } finally {
+      tm.state.contentPdf = false;
+      tm.state.deleted.pop();
     }
   });
 
