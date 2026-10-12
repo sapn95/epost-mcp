@@ -1147,3 +1147,45 @@ describe('what only the API can answer, when there is no API', () => {
     refused(raw, 'epost_read_storage_document');
   });
 });
+
+describe('letter text', () => {
+  let tm, ts;
+  before(async () => {
+    tm = await start();
+    tm.state.contentPdf = true;
+    ts = await startServer({ EPOST_API_BASE: tm.base, EPOST_TRANSPORT: 'api' });
+  });
+  after(async () => { ts?.stop(); await tm?.close(); });
+
+  test('reads what the letter says, without writing it anywhere', async () => {
+    const { data, raw } = await ts.call('epost_letter_text', { letter_id: 'inbox-2' });
+    assert.equal(data.transport, 'api', raw.slice(0, 200));
+    assert.equal(data.id, 'inbox-2');
+    assert.match(data.text, /Brief inbox-2/, 'the text of the letter that was asked for');
+    assert.match(data.text, /Frist: 31\. Oktober 2026/);
+    assert.match(data.text, /Grüessech/, 'decoded as UTF-8');
+    assert.equal(data.truncated, false);
+    assert.equal(data.chars, data.text.length);
+  });
+
+  test('says why when there is nothing to read', async () => {
+    assert.match((await ts.call('epost_letter_text', {})).data.error, /letter_id is required/);
+    assert.match((await ts.call('epost_letter_text', { letter_id: '  ' })).data.error, /letter_id is required/);
+    assert.match((await ts.call('epost_letter_text', { letter_id: 'nope' })).data.error, /no letter nope in the inbox/);
+    tm.state.contentAsHtml = true;
+    try {
+      assert.match((await ts.call('epost_letter_text', { letter_id: 'inbox-1' })).data.error, /not a PDF/);
+    } finally {
+      tm.state.contentAsHtml = false;
+    }
+  });
+
+  test('without pdftotext it says what to install', async () => {
+    const bare = await startServer({ EPOST_API_BASE: tm.base, EPOST_TRANSPORT: 'api', EPOST_PDFTOTEXT: '/nonexistent/pdftotext' });
+    try {
+      assert.match((await bare.call('epost_letter_text', { letter_id: 'inbox-1' })).data.error, /is not installed here: poppler-utils/);
+    } finally {
+      bare.stop();
+    }
+  });
+});
