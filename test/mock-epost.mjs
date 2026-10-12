@@ -78,6 +78,8 @@ export function start() {
     // answer by its LENGTH and zero is a falsy length, so an empty body was
     // saved and reported as a letter with `bytes: 0` beside it.
     contentEmpty: false,
+    // A real PDF with a text layer, for epost_letter_text.
+    contentPdf: false,
     // One folder that cannot be listed while its neighbours can. The archive
     // listing carries no folder field, so membership is derived by asking each
     // folder what it holds — and when one of those calls fails, the documents
@@ -194,6 +196,7 @@ export function start() {
       if (tail === '/content') {
         if (state.contentEmpty) return send(200, Buffer.alloc(0), 'application/pdf');
         if (state.contentAsHtml) return send(200, '<html><body>gateway error</body></html>', 'text/html');
+        if (state.contentPdf) return send(200, realPdf([`Brief ${id}`, 'Frist: 31. Oktober 2026', 'Grüessech']), 'application/pdf');
         return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
       }
       // The real eight PNG magic bytes. Written as a string, "\x89" goes out as
@@ -239,4 +242,26 @@ export function start() {
       close: () => new Promise(r => srv.close(r)),
     }));
   });
+}
+
+/** A one-page PDF with the given lines, built by hand, for pdftotext to read. */
+export function realPdf(lines) {
+  const body = lines.map((l, i) => `BT /F1 11 Tf 40 ${780 - i * 16} Td (${l.replace(/[()\\]/g, '\\$&')}) Tj ET`).join('\n');
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${Buffer.byteLength(body, 'latin1')} >>\nstream\n${body}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets = objects.map((o, i) => {
+    const at = Buffer.byteLength(out, 'latin1');
+    out += `${i + 1} 0 obj\n${o}\nendobj\n`;
+    return at;
+  });
+  const xref = Buffer.byteLength(out, 'latin1');
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, 'latin1');
 }

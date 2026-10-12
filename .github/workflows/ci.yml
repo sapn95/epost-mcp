@@ -61,6 +61,9 @@ jobs:
       - name: lint
         run: npm run lint
 
+      - name: pdftotext, for epost_letter_text
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends poppler-utils
+
       - name: chromium, for the browser half of the suite
         # Without it the browser tests fail on newPage rather than skip, which
         # is how they came to be left out of CI in the first place.
