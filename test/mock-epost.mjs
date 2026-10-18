@@ -25,6 +25,26 @@ const letter = (id, over = {}) => ({
   ...over,
 });
 
+// An e-mail as IncaMail delivers one, made up: reserved names only.
+export const emlFor = id => [
+  'Return-Path: <noreply@example.com>',
+  'Received: from mail.example.com by mx.example.com',
+  'MIME-Version: 1.0',
+  'From: Example_Sender <noreply@example.com>',
+  'To: Example_Recipient <someone@example.com>',
+  'Subject: Example_Mahnung',
+  'Date: Thu, 21 May 2026 11:45:16 +0200',
+  'Content-Type: multipart/mixed;',
+  ' boundary="example-boundary"',
+  '',
+  '--example-boundary',
+  'Content-Type: text/plain; charset=utf-8',
+  '',
+  `Example body of letter ${id}`,
+  '--example-boundary--',
+  '',
+].join('\r\n');
+
 // As long as a real one. A seven-character stand-in slipped under the
 // redactor's minimum length, which is there so that ordinary short words are
 // not mangled — and a test that cannot trip the redactor proves nothing.
@@ -200,6 +220,9 @@ export function start() {
       if (tail === '/content') {
         if (state.contentEmpty) return send(200, Buffer.alloc(0), 'application/pdf');
         if (state.contentAsHtml) return send(200, '<html><body>gateway error</body></html>', 'text/html');
+        if (state.contentAsJson) return send(200, '{"error":"internal"}', 'application/json');
+        // An IncaMail letter: the content endpoint hands back the e-mail itself.
+        if (state.contentAsEml) return send(200, emlFor(id), 'message/rfc822');
         if (state.contentPdf) return send(200, realPdf([`Brief ${id}`, 'Frist: 31. Oktober 2026', 'Grüessech']), 'application/pdf');
         return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
       }

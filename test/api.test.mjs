@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, existsSync, statSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
-import { start, TOKEN, API_KEY } from './mock-epost.mjs';
+import { start, TOKEN, API_KEY, emlFor } from './mock-epost.mjs';
 import { startServer } from './client.mjs';
 
 let mock, srv, out;
@@ -535,6 +535,23 @@ describe('the API answering no', () => {
       assert.deepEqual(readdirSync(bad), []);
     } finally {
       m.state.contentAsHtml = false;
+    }
+  });
+
+  test('a letter that came as an e-mail is kept as one, under .eml', async () => {
+    // IncaMail letters are the message itself, RFC 822, not a scan. Refusing
+    // them as "not a PDF, a gateway error page most likely" left one letter
+    // that no backup could ever copy, retried and reported every night.
+    const out = mkdtempSync(join(tmpdir(), 'epost-eml-'));
+    m.state.contentAsEml = true;
+    try {
+      const { data, raw } = await s.call('epost_download_letter', { letter_id: 'inbox-1', output_dir: out });
+      assert.match(String(data.saved), /_ePost_inbox-1\.eml$/, raw.slice(0, 200));
+      assert.equal(readFileSync(data.saved, 'latin1'), emlFor('inbox-1'));
+      const doc = await s.call('epost_read_storage_document', { letter_id: 'arch-1', output_dir: out });
+      assert.match(String(doc.data.saved), /_ePostStorage_arch-1\.eml$/, doc.raw.slice(0, 200));
+    } finally {
+      m.state.contentAsEml = false;
     }
   });
 
@@ -1281,6 +1298,40 @@ describe('letter PDF', () => {
     } finally {
       tm.state.contentPdf = false;
       tm.state.deleted.pop();
+    }
+  });
+
+  test('an e-mail letter comes back as the message, not as a PDF', async () => {
+    tm.state.contentAsEml = true;
+    try {
+      const { data, raw } = await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' });
+      assert.equal(data.format, 'eml', raw.slice(0, 300));
+      assert.equal(data.content_type, 'message/rfc822');
+      assert.equal(data.extension, 'eml');
+      assert.equal(Buffer.from(data.content_base64, 'base64').toString('latin1'), emlFor('inbox-1'));
+      assert.equal(data.bytes, Buffer.byteLength(emlFor('inbox-1'), 'latin1'));
+      assert.equal(data.pdf_base64, undefined, 'an e-mail handed out as a PDF');
+      assert.match((await ts.call('epost_letter_text', { letter_id: 'inbox-1' })).data.error, /is an e-mail \(IncaMail\), not a scan/);
+    } finally {
+      tm.state.contentAsEml = false;
+    }
+    const { data } = await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' });
+    assert.deepEqual([data.format, data.content_type, data.extension], ['pdf', 'application/pdf', 'pdf']);
+    assert.equal(data.content_base64, data.pdf_base64, 'a PDF keeps the field older clients read');
+  });
+
+  test('what is neither is named for what it is', async () => {
+    tm.state.contentAsJson = true;
+    try {
+      assert.match((await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.error, /not a PDF and not an e-mail: JSON/);
+    } finally {
+      tm.state.contentAsJson = false;
+    }
+    tm.state.contentAsHtml = true;
+    try {
+      assert.match((await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.error, /not a PDF and not an e-mail: an HTML page, most likely a gateway error page/);
+    } finally {
+      tm.state.contentAsHtml = false;
     }
   });
 
