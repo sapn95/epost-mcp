@@ -1315,6 +1315,13 @@ describe('letter PDF', () => {
     } finally {
       tm.state.contentAsEml = false;
     }
+    // A byte-order mark in front is still an e-mail.
+    tm.state.contentAsEml = 'bom';
+    try {
+      assert.equal((await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' })).data.format, 'eml');
+    } finally {
+      tm.state.contentAsEml = false;
+    }
     const { data } = await ts.call('epost_letter_pdf', { letter_id: 'inbox-1' });
     assert.deepEqual([data.format, data.content_type, data.extension], ['pdf', 'application/pdf', 'pdf']);
     assert.equal(data.content_base64, data.pdf_base64, 'a PDF keeps the field older clients read');

@@ -222,7 +222,7 @@ export function start() {
         if (state.contentAsHtml) return send(200, '<html><body>gateway error</body></html>', 'text/html');
         if (state.contentAsJson) return send(200, '{"error":"internal"}', 'application/json');
         // An IncaMail letter: the content endpoint hands back the e-mail itself.
-        if (state.contentAsEml) return send(200, emlFor(id), 'message/rfc822');
+        if (state.contentAsEml) return send(200, state.contentAsEml === 'bom' ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(emlFor(id))]) : emlFor(id), 'message/rfc822');
         if (state.contentPdf) return send(200, realPdf([`Brief ${id}`, 'Frist: 31. Oktober 2026', 'Grüessech']), 'application/pdf');
         return send(200, Buffer.from(`%PDF-1.4 mock ${id}`), 'application/octet-stream');
       }
