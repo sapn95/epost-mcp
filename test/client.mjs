@@ -58,5 +58,16 @@ export async function startServer(env = {}, { timeout = 15000 } = {}) {
       return { raw: t, isError: !!r.result?.isError, ...(typeof parsed === 'object' && parsed !== null ? { data: parsed } : { data: {} }), parsed };
     },
     stop() { child.stdin.end(); child.kill(); },
+    // Go away the way a real client does: close the pipe and send no signal.
+    // Resolves with how long the server took to leave and its exit code, or
+    // with left:false after `wait` ms, having then killed it.
+    disconnect(wait = 8000) {
+      const t = Date.now();
+      return new Promise(resolve => {
+        const giveUp = setTimeout(() => { child.kill(); resolve({ left: false, ms: Date.now() - t }); }, wait);
+        child.on('exit', code => { clearTimeout(giveUp); resolve({ left: true, code, ms: Date.now() - t }); });
+        child.stdin.end();
+      });
+    },
   };
 }
