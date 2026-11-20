@@ -95,9 +95,12 @@ try {
   // one thing the dispatcher answers with "unknown tool", and every other
   // outcome, error included, proves a branch exists.
   for (const n of names) {
-    const r = await send("tools/call", { name: n, arguments: {} }).catch(e => ({ error: e }));
-    const said = JSON.stringify(r?.result ?? r?.error ?? r);
-    check(!/unknown tool/i.test(said), `${n}: reaches a dispatcher branch`);
+    // A call that never came back proves nothing about a branch: an Error
+    // serialises to "{}", which does not say "unknown tool" either.
+    let r = null, failed = null;
+    try { r = await send("tools/call", { name: n, arguments: {} }); } catch (e) { failed = e.message; }
+    const said = JSON.stringify(r?.result ?? r?.error ?? null);
+    check(!failed && r !== null && !/unknown tool/i.test(said), `${n}: reaches a dispatcher branch${failed ? ` (${failed})` : ''}`);
   }
 
   // And nothing may be dispatched that is not advertised: a tool only the

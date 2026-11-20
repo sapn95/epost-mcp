@@ -2526,14 +2526,24 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
 // nobody reaped. The self-heal in getContext exists because of that; this stops
 // it happening in the first place.
 let closing = false;
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.on(sig, async () => {
-    if (closing) return;
-    closing = true;
-    try { await ctx?.close(); } catch { /* going away regardless */ }
-    process.exit(0);
-  });
+async function leave() {
+  if (closing) return;
+  closing = true;
+  // With a deadline. Closing the context in good order can outlast any wait a
+  // client is prepared to make — measured here, it did not come back at all
+  // until a kill signal arrived. Exiting is enough to take the browser down:
+  // Playwright ends the browsers it started when this process goes.
+  const closed = ctx ? ctx.close().catch(() => {}) : null;
+  if (closed) await Promise.race([closed, new Promise(r => { setTimeout(r, 1500); })]);
+  process.exit(0);
 }
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, leave);
+// A signal is not how a client goes away. It closes our stdin, and the
+// transport does not report that as a close — so the browser child kept this
+// process alive, and the orphaned Chrome this block exists to prevent was left
+// behind by every ordinary disconnect instead of by a kill.
+process.stdin.on('end', leave);
+process.stdin.on('close', leave);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
